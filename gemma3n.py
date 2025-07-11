@@ -344,8 +344,131 @@ def ask_gemma(prompt):
         clean_up_tokenization_spaces=False
     )
     return text[0]  # text[0] injects <bos>prompt
+
+def ask_gemma_with_image(image_path, prompt="What do you see in this image?"):
+    """
+    Process image with text prompt using Gemma3n
+    
+    Args:
+        image_path: Path to the image file
+        prompt: Text prompt to ask about the image
+    
+    Returns:
+        Generated text response
+    """
+    from PIL import Image
+    
+    # Load and process image
+    image = Image.open(image_path).convert('RGB')
+    
+    # Process both image and text
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to(model.device)
+    
+    # Generate response
+    outputs = model.generate(**inputs, max_new_tokens=512, disable_compile=True)
+    
+    # Decode response
+    response = processor.batch_decode(
+        outputs,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False
+    )
+    return response[0]
+
+def classify_mushroom_with_gemma(image_path, class_names):
+    """
+    Classify mushroom image using Gemma3n with structured prompt
+    
+    Args:
+        image_path: Path to mushroom image
+        class_names: List of possible mushroom classes
+    
+    Returns:
+        Classification result
+    """
+    prompt = f"""Look at this mushroom image. 
+What type of mushroom is this? 
+Choose from these options: {', '.join(class_names)}
+Provide a clear answer with reasoning."""
+    
+    return ask_gemma_with_image(image_path, prompt)
+
+def analyze_mushroom_features(image_path):
+    """
+    Analyze detailed features of a mushroom image
+    """
+    prompt = """Analyze this mushroom image in detail. Describe:
+1. Cap shape and color
+2. Stem characteristics  
+3. Gill/pore structure
+4. Overall size and appearance
+5. Any distinctive features"""
+    
+    return ask_gemma_with_image(image_path, prompt)
 # %%
 %%time
 prompt_history = ask_gemma("It was a dark and stormy night.")
 print(prompt_history)
 print()
+
+# %%
+# Test Gemma3n with mushroom dataset images
+import random
+
+def test_gemma_with_mushroom_images(num_samples=3):
+    """
+    Test Gemma3n with random mushroom images from the dataset
+    """
+    print("Testing Gemma3n with mushroom images...")
+    print("="*50)
+    
+    # Get random samples from the dataset
+    random_samples = random.sample(path_label, min(num_samples, len(path_label)))
+    
+    for i, (image_path, label_idx) in enumerate(random_samples):
+        print(f"\n--- Sample {i+1} ---")
+        print(f"Image path: {image_path}")
+        print(f"True class: {class_names[label_idx]}")
+        
+        try:
+            # Basic image description
+            print("\n1. Basic image description:")
+            description = ask_gemma_with_image(image_path, "Describe this image in detail.")
+            print(description)
+            
+            # Mushroom classification
+            print("\n2. Mushroom classification:")
+            classification = classify_mushroom_with_gemma(image_path, class_names)
+            print(classification)
+            
+            # Feature analysis
+            print("\n3. Feature analysis:")
+            analysis = analyze_mushroom_features(image_path)
+            print(analysis)
+            
+        except Exception as e:
+            print(f"Error processing image: {e}")
+        
+        print("\n" + "="*50)
+
+def compare_resnet_vs_gemma(image_path, label_idx):
+    """
+    Compare ResNet152 prediction vs Gemma3n analysis for the same image
+    """
+    print(f"Comparing ResNet152 vs Gemma3n for image: {image_path}")
+    print(f"True class: {class_names[label_idx]}")
+    print("-"*40)
+    
+    # ResNet152 prediction (would need model to be loaded)
+    print("ResNet152 prediction: [Model needs to be loaded]")
+    
+    # Gemma3n analysis
+    print("\nGemma3n analysis:")
+    try:
+        classification = classify_mushroom_with_gemma(image_path, class_names)
+        print(classification)
+    except Exception as e:
+        print(f"Error: {e}")
+
+# Example usage (uncomment to run):
+# test_gemma_with_mushroom_images(num_samples=2)
