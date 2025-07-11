@@ -405,20 +405,13 @@ def analyze_mushroom_features(image_path):
 5. Any distinctive features"""
     
     return ask_gemma_with_image(image_path, prompt)
-# %%
-%%time
-prompt_history = ask_gemma("It was a dark and stormy night.")
-print(prompt_history)
-print()
-
-# %%
-# Test Gemma3n with mushroom dataset images
-import random
 
 def test_gemma_with_mushroom_images(num_samples=3):
     """
     Test Gemma3n with random mushroom images from the dataset
     """
+    import random
+    
     print("Testing Gemma3n with mushroom images...")
     print("="*50)
     
@@ -470,5 +463,20 @@ def compare_resnet_vs_gemma(image_path, label_idx):
     except Exception as e:
         print(f"Error: {e}")
 
+# %%
+%%time
+prompt_history = ask_gemma("It was a dark and stormy night.")
+print(prompt_history)
+print()
+
+# %%
 # Example usage (uncomment to run):
 # test_gemma_with_mushroom_images(num_samples=2)
+# 
+# # Test with specific image:
+# if path_label:
+#     sample_path, sample_label = path_label[0]
+#     result = classify_mushroom_with_gemma(sample_path, class_names)
+#     print(f"Classification result: {result}")
+
+# %%
