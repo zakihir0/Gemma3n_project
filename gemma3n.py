@@ -112,8 +112,7 @@ image_path, label = path_label[0]
 # Vision Fine-tuning Implementation for Mushroom Classification
 from unsloth import FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
-from transformers import TrainingArguments
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 from datasets import Dataset
 from PIL import Image
 import torch.nn.functional as F
@@ -234,9 +233,13 @@ class MushroomVisionFineTuner:
                 use_gradient_checkpointing="unsloth",
                 random_state=42,
             )
+            # Training用にモデルを有効化（重要）
+            FastVisionModel.for_training(self.vision_model)
+            
             print(f"✅ Vision model設定完了")
             print(f"   Vision層 fine-tuning: {finetune_vision_layers}")
             print(f"   Language層 fine-tuning: {finetune_language_layers}")
+            print(f"   Training mode有効化: ✅")
             
         except Exception as e:
             print(f"❌ Vision model設定エラー: {str(e)}")
@@ -267,26 +270,32 @@ class MushroomVisionFineTuner:
         print(f"   学習率: {learning_rate}")
         
         try:
-            # 訓練引数設定
-            training_args = TrainingArguments(
+            # 訓練引数設定（SFTConfig使用）
+            training_args = SFTConfig(
                 output_dir=output_dir,
                 num_train_epochs=num_epochs,
                 per_device_train_batch_size=batch_size,
                 per_device_eval_batch_size=batch_size,
+                gradient_accumulation_steps=4,  # メモリ効率化
                 learning_rate=learning_rate,
                 warmup_steps=50,
                 logging_steps=10,
-                evaluation_strategy="steps",
+                eval_strategy="steps",
                 eval_steps=50,
                 save_strategy="steps",
                 save_steps=100,
                 load_best_model_at_end=True,
                 metric_for_best_model="eval_loss",
                 greater_is_better=False,
+                # Vision特有の設定
                 remove_unused_columns=False,
+                dataset_text_field="",
+                dataset_kwargs={"skip_prepare_dataset": True},
                 dataloader_pin_memory=False,
-                gradient_checkpointing=True,
                 fp16=True,
+                optim="adamw_8bit",  # メモリ効率化
+                weight_decay=0.01,
+                lr_scheduler_type="linear",
                 report_to="none",  # WandBなどのログを無効
             )
             
@@ -297,7 +306,7 @@ class MushroomVisionFineTuner:
                 train_dataset=train_dataset,
                 eval_dataset=val_dataset,
                 formatting_func=formatting_func_for_vision,
-                data_collator=UnslothVisionDataCollator(tokenizer=self.base_tokenizer),
+                data_collator=UnslothVisionDataCollator(model=self.vision_model, processor=self.base_tokenizer),
                 args=training_args,
                 max_seq_length=512,
             )
@@ -949,129 +958,17 @@ class ImageDatabaseRAG:
 
 
 class MobileMushroomWorkflow:
-    """モバイル端末向けキノコ識別ワークフロー統合クラス - 3ステップ版 + Vision Fine-tuning対応"""
+    """モバイル端末向けキノコ識別ワークフロー統合クラス - 3ステップ版"""
     
     def __init__(self, model, tokenizer, embedding_model):
         # 3ステップワークフロー用コンポーネント初期化
         
-        # Base models
-        self.base_model = model
-        self.base_tokenizer = tokenizer
-        
-        # Vision Fine-tuning
-        self.vision_finetuner = MushroomVisionFineTuner(model, tokenizer)
-        
-        # Step 1: 画像マッチング（base modelでスタート、後でfine-tunedに変更可能）
+        # Step 1: 画像マッチング
         self.image_db = ImageDatabaseRAG("dataset", model, tokenizer)
         
         # Step 2: Wikipedia検索
         self.wikipedia_rag = WikipediaRAG('all-MiniLM-L6-v2')
-        
-        # Fine-tuning状態管理
-        self.use_fine_tuned_model = False
 
-    def run_vision_fine_tuning(self, image_paths: List[str], labels: List[str], 
-                              class_names: List[str], output_dir: str = "./mushroom_vision_model",
-                              max_samples_per_class: int = 10, num_epochs: int = 3):
-        """
-        Vision Fine-tuningを実行
-        
-        Args:
-            image_paths: 画像パスのリスト
-            labels: ラベルのリスト
-            class_names: クラス名のリスト
-            output_dir: モデル保存ディレクトリ
-            max_samples_per_class: クラスあたりの最大サンプル数
-            num_epochs: エポック数
-        """
-        print(f"🎯 Vision Fine-tuning開始...")
-        print(f"   対象画像数: {len(image_paths)}")
-        print(f"   クラス数: {len(class_names)}")
-        print(f"   クラスあたり最大サンプル数: {max_samples_per_class}")
-        
-        try:
-            # データセット準備
-            dataset_manager = MushroomVisionDataset(image_paths, labels, class_names)
-            train_dataset, val_dataset = dataset_manager.prepare_vision_dataset(
-                max_samples_per_class=max_samples_per_class
-            )
-            
-            # Vision modelセットアップ
-            self.vision_finetuner.setup_vision_model(
-                finetune_vision_layers=True,
-                finetune_language_layers=False
-            )
-            
-            # 訓練実行
-            self.vision_finetuner.train_vision_model(
-                train_dataset=train_dataset,
-                val_dataset=val_dataset,
-                output_dir=output_dir,
-                num_epochs=num_epochs,
-                batch_size=2,  # VRAM制約のため小さく設定
-                learning_rate=2e-5
-            )
-            
-            # Fine-tunedモデルを有効化
-            self.use_fine_tuned_model = True
-            self._update_models_to_fine_tuned()
-            
-            print(f"🎉 Vision Fine-tuning完了！")
-            print(f"   モデル保存先: {output_dir}")
-            print(f"   Fine-tunedモデルが有効化されました")
-            
-        except Exception as e:
-            print(f"❌ Fine-tuning失敗: {str(e)}")
-            raise e
-    
-    def load_fine_tuned_model(self, model_path: str):
-        """
-        保存済みのFine-tunedモデルをロード
-        
-        Args:
-            model_path: モデルのパス
-        """
-        try:
-            print(f"📂 Fine-tunedモデルロード: {model_path}")
-            
-            # Fine-tunedモデルをロード
-            self.vision_finetuner.load_fine_tuned_model(model_path)
-            
-            # Fine-tunedモデルを有効化
-            self.use_fine_tuned_model = True
-            self._update_models_to_fine_tuned()
-            
-            print(f"✅ Fine-tunedモデルロード完了")
-            
-        except Exception as e:
-            print(f"❌ モデルロード失敗: {str(e)}")
-            raise e
-    
-    def _update_models_to_fine_tuned(self):
-        """内部的にfine-tunedモデルを使用するように切り替え"""
-        if self.vision_finetuner.is_fine_tuned:
-            fine_tuned_model = self.vision_finetuner.get_model_for_inference()
-            # ImageDatabaseRAGのモデルを更新
-            self.image_db.gemma_model = fine_tuned_model
-            print(f"🔄 ImageDatabaseRAGをFine-tunedモデルに切り替え")
-    
-    def switch_to_base_model(self):
-        """ベースモデルに戻す"""
-        self.use_fine_tuned_model = False
-        self.image_db.gemma_model = self.base_model
-        print(f"🔄 ベースモデルに切り替え")
-    
-    def get_model_status(self):
-        """現在のモデル状態を確認"""
-        status = {
-            'use_fine_tuned': self.use_fine_tuned_model,
-            'fine_tuned_available': self.vision_finetuner.is_fine_tuned,
-            'current_model': 'Fine-tuned' if self.use_fine_tuned_model else 'Base'
-        }
-        print(f"📊 モデル状態:")
-        for key, value in status.items():
-            print(f"   {key}: {value}")
-        return status
 
     def initialize_image_database(self, image_dataset_path: str, class_names: List[str], 
                                  paths: List[str], classes: List[str]):
@@ -1234,6 +1131,158 @@ class MobileMushroomWorkflow:
 
 
 #%%
+# Vision Fine-tuning 独立実行セクション
+print("\n" + "=" * 80)
+print("🎯 Vision Fine-tuning 独立実行セクション")
+print("=" * 80)
+print("📋 このセクションはキノコ画像でのVision Fine-tuningを独立して実行します")
+print("📋 モバイルワークフローとは完全に分離されています")
+
+# Fine-tuning実行関数
+def run_mushroom_vision_finetuning(image_paths: List[str], labels: List[str], 
+                                  class_names: List[str], base_model, base_tokenizer,
+                                  output_dir: str = "./mushroom_vision_finetuned",
+                                  max_samples_per_class: int = 5, num_epochs: int = 2):
+    """
+    キノコ画像でのVision Fine-tuningを独立実行
+    
+    Args:
+        image_paths: 画像パスのリスト
+        labels: ラベルのリスト
+        class_names: クラス名のリスト
+        base_model: ベースGemma3nモデル
+        base_tokenizer: ベーストークナイザー
+        output_dir: モデル保存ディレクトリ
+        max_samples_per_class: クラスあたりの最大サンプル数
+        num_epochs: エポック数
+    
+    Returns:
+        Fine-tunedモデルとトークナイザー
+    """
+    print(f"🚀 キノコ画像Vision Fine-tuning開始...")
+    print(f"   対象画像数: {len(image_paths)}")
+    print(f"   クラス数: {len(class_names)}")
+    print(f"   クラスあたり最大サンプル数: {max_samples_per_class}")
+    print(f"   エポック数: {num_epochs}")
+    print(f"   保存先: {output_dir}")
+    
+    try:
+        # Step 1: データセット準備
+        print(f"\n📊 Step 1: データセット準備")
+        dataset_manager = MushroomVisionDataset(image_paths, labels, class_names)
+        train_dataset, val_dataset = dataset_manager.prepare_vision_dataset(
+            max_samples_per_class=max_samples_per_class
+        )
+        
+        # Step 2: Fine-tunerセットアップ
+        print(f"\n🔧 Step 2: Fine-tuner初期化")
+        finetuner = MushroomVisionFineTuner(base_model, base_tokenizer)
+        finetuner.setup_vision_model(
+            finetune_vision_layers=True,
+            finetune_language_layers=False
+        )
+        
+        # Step 3: 訓練実行
+        print(f"\n📈 Step 3: 訓練実行")
+        finetuner.train_vision_model(
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            output_dir=output_dir,
+            num_epochs=num_epochs,
+            batch_size=1,  # VRAM制約のため1に設定
+            learning_rate=2e-5
+        )
+        
+        print(f"\n🎉 Vision Fine-tuning完了！")
+        print(f"   保存先: {output_dir}")
+        
+        return finetuner.get_model_for_inference(), base_tokenizer
+        
+    except Exception as e:
+        print(f"\n❌ Fine-tuning失敗: {str(e)}")
+        raise e
+
+# Fine-tunedモデルでワークフロー作成関数
+def create_workflow_with_finetuned_model(finetuned_model, tokenizer, embedding_model):
+    """
+    Fine-tunedモデルを使用してワークフローを作成
+    
+    Args:
+        finetuned_model: Fine-tunedモデル
+        tokenizer: トークナイザー
+        embedding_model: Embedingモデル
+        
+    Returns:
+        Fine-tunedモデルを使用するワークフロー
+    """
+    print(f"🔄 Fine-tunedモデルでワークフロー作成中...")
+    
+    # Fine-tunedモデルを使用してワークフロー作成
+    workflow = MobileMushroomWorkflow(
+        model=finetuned_model,
+        tokenizer=tokenizer,
+        embedding_model=embedding_model
+    )
+    
+    print(f"✅ Fine-tunedワークフロー作成完了")
+    return workflow
+
+#%%
+# Vision Fine-tuning実行例
+print("\n" + "=" * 80)
+print("🚀 Vision Fine-tuning実行例")
+print("=" * 80)
+
+# Fine-tuning設定
+OUTPUT_DIR = "./mushroom_vision_finetuned"
+MAX_SAMPLES_PER_CLASS = 3  # VRAM制約のため少なく設定
+NUM_EPOCHS = 1  # テスト用に短く設定
+
+# Fine-tuning実行
+print(f"\n📚 Step 1: Fine-tuning実行")
+finetuned_model, finetuned_tokenizer = run_mushroom_vision_finetuning(
+    image_paths=paths,
+    labels=classes,
+    class_names=class_names,
+    base_model=model,
+    base_tokenizer=tokenizer,
+    output_dir=OUTPUT_DIR,
+    max_samples_per_class=MAX_SAMPLES_PER_CLASS,
+    num_epochs=NUM_EPOCHS
+)
+#%%
+print(f"\n🔄 Step 2: Fine-tunedモデルでワークフロー作成")
+from sentence_transformers import SentenceTransformer
+temp_embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+finetuned_workflow = create_workflow_with_finetuned_model(
+    finetuned_model=finetuned_model,
+    tokenizer=finetuned_tokenizer,
+    embedding_model=temp_embedding_model
+)
+
+print(f"\n📊 Step 3: Fine-tunedワークフローでデータベース初期化")
+finetuned_workflow.initialize_image_database(dir0, class_names, paths, classes)
+
+print(f"\n🧪 Step 4: Fine-tunedワークフローでテスト実行")
+test_question = "このキノコは食べられますか？"
+print(f"テスト画像: {image_path}")
+print(f"質問: {test_question}")
+
+# Fine-tunedモデルで推論実行
+result = finetuned_workflow.process_image(image_path, test_question, verbose=True)
+
+print(f"\n📊 Fine-tuned結果:")
+print(f"   候補種: {', '.join(result.candidate_species[:3])}")
+print(f"   類似度スコア: {[f'{s:.3f}' for s in result.similarity_scores[:3]]}")
+print(f"   安全警告数: {len(result.safety_warnings)}")
+print(f"   最終回答: {result.final_answer[:100]}...")
+print(f"   推奨アクション: {result.recommendation}")
+
+print(f"\n🎉 Fine-tuningワークフロー完了!")
+
+
+#%%
 # モバイルワークフローのテスト実行
 
 # ワークフロー初期化
@@ -1291,97 +1340,3 @@ except Exception as e:
     traceback.print_exc()
 
 print("\n🏁 3ステップテスト完了")
-
-#%%
-# 追加テスト: 3ステップ複数質問パターン
-print("\n" + "=" * 80)
-print("🔬 3ステップ追加テスト: 複数質問パターン")
-print("=" * 80)
-print("📊 各テストで3ステップワークフローを実行し、シンプルな結果を出力")
-
-test_questions = [
-    "この種類は何ですか？",
-    "毒性はありますか？",
-    "調理方法を教えてください",
-    None  # 質問なし
-]
-
-for i, question in enumerate(test_questions, 1):
-    print(f"\n--- 3ステップテスト {i}/4 ---")
-    print(f"質問: {question if question else '(質問なし)'}")
-    
-    try:
-        # シンプルな実行（verbose=False）
-        start_time = time.time()
-        result = mobile_workflow.process_image(image_path, question, verbose=False)
-        execution_time = time.time() - start_time
-        
-        print(f"✅ 実行成功 (実行時間: {execution_time:.2f}秒)")
-        print(f"   🔬 候補種: {result.candidate_species[:2]}")  # 上位2つ
-        print(f"   📈 類似度: {[f'{s:.2f}' for s in result.similarity_scores[:2]]}")
-        print(f"   ⚠️ 警告: {len(result.safety_warnings)}件")
-        print(f"   🎯 推奨: {result.recommendation[:50]}...")
-                
-    except Exception as e:
-        print(f"❌ 実行失敗: {str(e)}")
-
-print("\n🎯 全3ステップテスト完了")
-print("📊 各テストでシンプルな構造化結果が正常に生成されました")
-
-#%%
-# Vision Fine-tuning使用例とテスト
-print("\n" + "=" * 80)
-print("🎯 Vision Fine-tuning使用例")
-print("=" * 80)
-print("📋 このセクションではキノコ画像でのVision Fine-tuningの使用方法を示します")
-
-# Fine-tuning実行例（コメントアウト - 実際に実行する場合は有効化）
-"""
-# Vision Fine-tuning実行例:
-print("\\n🔧 Vision Fine-tuning実行例:")
-print("# 1. Fine-tuningを実行")
-print("mobile_workflow.run_vision_fine_tuning(")
-print("    image_paths=paths,")
-print("    labels=classes,") 
-print("    class_names=class_names,")
-print("    output_dir='./mushroom_vision_finetuned',")
-print("    max_samples_per_class=5,  # 各クラス5枚まで")
-print("    num_epochs=2  # 短時間テスト用")
-print(")")
-print("")
-print("# 2. Fine-tunedモデルの状態確認")
-print("mobile_workflow.get_model_status()")
-print("")
-print("# 3. 保存済みモデルをロード（次回起動時）")
-print("mobile_workflow.load_fine_tuned_model('./mushroom_vision_finetuned')")
-print("")
-print("# 4. ベースモデルに戻す")
-print("mobile_workflow.switch_to_base_model()")
-"""
-
-# モデル状態確認
-print("\n📊 現在のモデル状態:")
-status = mobile_workflow.get_model_status()
-
-# Fine-tuning準備情報
-print(f"\n🔧 Fine-tuning準備状況:")
-print(f"   利用可能画像数: {len(paths)}")
-print(f"   利用可能クラス数: {len(class_names)}")
-print(f"   推奨設定:")
-print(f"     - max_samples_per_class: 5-10 (VRAM制約のため)")
-print(f"     - num_epochs: 2-3 (過学習防止)")
-print(f"     - batch_size: 1-2 (VRAM制約のため)")
-
-print(f"\n💡 Fine-tuning実行手順:")
-print(f"   1. mobile_workflow.run_vision_fine_tuning() でFine-tuning実行")
-print(f"   2. 自動的にFine-tunedモデルに切り替わります")
-print(f"   3. process_image()でFine-tunedモデルが使用されます")
-print(f"   4. mobile_workflow.switch_to_base_model() でベースモデルに戻せます")
-
-print(f"\n⚠️ 注意事項:")
-print(f"   - Vision Fine-tuningは大量のVRAM（15GB以上）を消費します")
-print(f"   - Colab無料版では制限があるため、小さなデータセットで実行してください")
-print(f"   - Fine-tuningにより、キノコ画像識別の精度向上が期待できます")
-
-print("\n🏁 Vision Fine-tuning使用例完了")
-print("📚 詳細な実装方法は上記のクラス定義とメソッドを参照してください")
