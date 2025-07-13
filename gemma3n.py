@@ -429,15 +429,24 @@ class ImageDatabaseRAG:
         
         print(f"🚀 画像インデックス構築開始: {total_images}枚の画像を処理中...")
         
+        # 進捗バー用変数
+        successful_extractions = 0
+        failed_extractions = 0
+        
         for i, idx in enumerate(selected_indices):
             try:
                 image_path = paths[idx]
                 class_name = classes[idx]
                 
-                print(f"📸 [{i+1}/{total_images}] 処理中: {class_name}")
+                # 進捗バー表示
+                progress = (i + 1) / total_images * 100
+                bar_length = 30
+                filled_length = int(bar_length * (i + 1) // total_images)
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                print(f"\r📸 [{i+1:3d}/{total_images}] [{bar}] {progress:5.1f}% | {class_name[:20]:<20}", end='', flush=True)
                 
                 # Gemma3nで画像から特徴ベクトルを抽出
-                image_embedding = self._extract_image_features(image_path, class_name)
+                image_embedding = self._extract_image_features(image_path, class_name, verbose=False)
                 
                 if image_embedding is not None:
                     embeddings.append(image_embedding)
@@ -447,13 +456,16 @@ class ImageDatabaseRAG:
                         'class_id': class_names.index(class_name) if class_name in class_names else -1,
                         'index': idx
                     })
-                    print(f"✅ 完了: ベクトル次元 {image_embedding.shape}")
+                    successful_extractions += 1
                 else:
-                    print(f"❌ 失敗: 特徴ベクトル取得不可")
+                    failed_extractions += 1
                 
             except Exception as e:
-                print(f"❌ エラー: {str(e)}")
+                failed_extractions += 1
                 continue
+        
+        # 進捗バー完了
+        print(f"\n✅ 画像処理完了: 成功 {successful_extractions}件, 失敗 {failed_extractions}件")
         
         if embeddings:
             print(f"🔧 FAISSインデックス構築中...")
@@ -498,19 +510,21 @@ class ImageDatabaseRAG:
         else:
             print(f"❌ 画像インデックス構築失敗: 有効な特徴ベクトルが0個")
 
-    def _extract_image_features(self, image_path: str, class_name: str) -> Optional[np.ndarray]:
+    def _extract_image_features(self, image_path: str, class_name: str, verbose: bool = True) -> Optional[np.ndarray]:
         """
         Gemma3nを使用して画像から特徴ベクトルを抽出
         
         Args:
             image_path: 画像ファイルパス
             class_name: 画像のクラス名
+            verbose: 詳細ログの表示
             
         Returns:
             特徴ベクトル (numpy配列)
         """
         try:
-            print(f"🔍 Gemma3nで画像特徴抽出中: {image_path} (クラス: {class_name})")
+            if verbose:
+                print(f"🔍 Gemma3nで画像特徴抽出中: {image_path} (クラス: {class_name})")
             
             # Gemma3nに画像の特徴抽出を依頼
             feature_messages = [{
@@ -537,12 +551,14 @@ class ImageDatabaseRAG:
                 hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
                 feature_vector = hidden_states.mean(dim=1).squeeze().cpu().numpy()  # [hidden_dim]
             
-            print(f"✅ 特徴ベクトル抽出完了: {feature_vector.shape}")
+            if verbose:
+                print(f"✅ 特徴ベクトル抽出完了: {feature_vector.shape}")
             return feature_vector
             
         except Exception as e:
-            print(f"⚠️ Gemma3n特徴抽出でエラー発生: {str(e)}")
-            print(f"🔄 フォールバック: 擬似ベクトルを使用 (クラス: {class_name})")
+            if verbose:
+                print(f"⚠️ Gemma3n特徴抽出でエラー発生: {str(e)}")
+                print(f"🔄 フォールバック: 擬似ベクトルを使用 (クラス: {class_name})")
             # フォールバック: クラス名ベースの擬似ベクトル
             return self._create_fallback_vector(class_name)
 
@@ -579,20 +595,15 @@ class ImageDatabaseRAG:
             return []
 
         try:
-            print(f"🔍 クエリ画像の類似検索開始: {query_image_path}")
-            
             # Gemma3nでクエリ画像の特徴ベクトルを抽出
-            query_vector = self._extract_image_features(query_image_path, "query")
+            query_vector = self._extract_image_features(query_image_path, "query", verbose=False)
             
             if query_vector is None:
-                print(f"❌ クエリ画像の特徴抽出に失敗")
                 return []
             
             # ベクトルを正規化してFAISS用に準備
             query_embedding = query_vector.reshape(1, -1).astype(np.float32)
             faiss.normalize_L2(query_embedding)
-            
-            print(f"🔍 FAISSで類似検索実行中: top_{top_k}")
             
             # 類似画像検索
             scores, indices = self.index.search(query_embedding, top_k)
@@ -603,13 +614,10 @@ class ImageDatabaseRAG:
                     metadata = self.image_metadata[idx].copy()
                     metadata['similarity_score'] = float(score)
                     similar_images.append(metadata)
-                    print(f"  {i+1}. {metadata['class']} (類似度: {score:.3f})")
             
-            print(f"✅ 類似検索完了: {len(similar_images)}件の結果")
             return similar_images
             
         except Exception as e:
-            print(f"❌ 類似検索エラー: {str(e)}")
             return []
 
     def get_class_examples(self, class_name: str, max_examples: int = 3) -> List[Dict]:
@@ -629,6 +637,33 @@ class ImageDatabaseRAG:
                 examples.append(metadata)
         
         return examples
+
+    def display_image_comparison(self, query_image_path: str, similar_images: List[Dict], top_n: int = 3):
+        """
+        テスト用: クエリ画像と類似画像を比較表示
+        
+        Args:
+            query_image_path: テスト画像のパス
+            similar_images: 類似検索結果
+            top_n: 表示する類似画像数
+        """
+        print(f"\n📊 画像比較結果:")
+        print(f"🎯 テスト画像: {query_image_path}")
+        print(f"📝 ファイル名: {query_image_path.split('/')[-1]}")
+        
+        print(f"\n🔍 類似画像 Top {min(top_n, len(similar_images))}:")
+        for i, img in enumerate(similar_images[:top_n]):
+            similarity_percent = img['similarity_score'] * 100
+            print(f"  {i+1}. {img['class']} (類似度: {similarity_percent:.1f}%)")
+            print(f"     📁 ファイル: {img['path'].split('/')[-1]}")
+            print(f"     🗂️  フルパス: {img['path']}")
+            
+            # 類似度の視覚的表示
+            bar_length = 20
+            filled_length = int(bar_length * img['similarity_score'])
+            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+            print(f"     📊 [{bar}] {similarity_percent:.1f}%")
+            print()
 
 
 class MobileMushroomWorkflow:
@@ -686,6 +721,10 @@ class MobileMushroomWorkflow:
             if verbose:
                 print("🔍 Step 1: 画像マッチング中...")
             similar_images = self.image_db.find_similar_images(image_path, top_k=5)
+            
+            # デバッグ用: 画像比較表示
+            if verbose and similar_images:
+                self.image_db.display_image_comparison(image_path, similar_images, top_n=3)
             
             # 上位類似画像から候補種を抽出
             candidate_species = [img.get('class', '不明') for img in similar_images[:3]]
@@ -843,7 +882,7 @@ try:
     
     # 結果表示
     print(f"🔬 候補種: {', '.join(result.candidate_species)}")
-    print(f"📈 類似度スコア: {result.similarity_scores}")
+    print(f"📈 類似度スコア: {[f'{s:.3f}' for s in result.similarity_scores]}")
     print(f"⚠️ 安全警告: {len(result.safety_warnings)}件")
     for warning in result.safety_warnings[:3]:
         print(f"   - {warning}")
