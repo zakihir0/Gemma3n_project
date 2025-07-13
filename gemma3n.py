@@ -354,584 +354,16 @@ Answer:"""
 
 # %%
 # Mobile Mushroom Identification Workflow
-
-@dataclass
-class SpeciesCandidate:
-    """種候補データ構造"""
-    name: str
-    score: float
-
-@dataclass
-class RAGQuery:
-    """RAG検索用クエリ"""
-    text: str
-    embedding: Optional[List[float]] = None
-
-@dataclass
-class Document:
-    """検索結果文書"""
-    content: str
-    metadata: Dict[str, Any]
-    relevance_score: float
-
-@dataclass
-class IdentificationResult:
-    """Step 10: JSON互換識別結果"""
-    species_name: str
-    confidence_score: float
-    compatibility_score: float
-    visual_features: str
-
-@dataclass
-class SafetyAssessment:
-    """Step 10: 安全性評価"""
-    toxicity_level: int  # 1-5 (1=安全, 5=非常に危険)
-    edibility: str  # "edible", "toxic", "unknown", "caution"
-    warnings: List[str]
-    safety_notes: str
-
-@dataclass
-class CookingInformation:
-    """Step 10: 調理情報"""
-    is_edible: bool
-    preparation_methods: List[str]
-    cooking_tips: str
-    contraindications: List[str]
-
-@dataclass
-class ProcessingMetadata:
-    """Step 10: メタデータ"""
-    processing_time: float
-    confidence_level: str  # "high", "medium", "low"
-    data_sources: List[str]
-    similarity_matches: int
-    wikipedia_sources: int
-
 @dataclass
 class WorkflowResult:
-    """Step 10: JSON互換構造化結果"""
-    # 主要結果
-    identification: IdentificationResult
-    safety: SafetyAssessment
-    cooking: CookingInformation
-    metadata: ProcessingMetadata
-    
-    # 推奨アクション
-    recommended_action: str
-    error_handling: Optional[str] = None
-    
-    # 互換性のための従来フィールド
-    final_answer: Optional[str] = None
-    confidence_score: Optional[float] = None
-    followup_action: Optional[str] = None
-    
-    def to_json_dict(self) -> Dict[str, Any]:
-        """JSON互換辞書に変換"""
-        return {
-            "identification": {
-                "species_name": self.identification.species_name,
-                "confidence_score": self.identification.confidence_score,
-                "compatibility_score": self.identification.compatibility_score,
-                "visual_features": self.identification.visual_features
-            },
-            "safety_assessment": {
-                "toxicity_level": self.safety.toxicity_level,
-                "edibility": self.safety.edibility,
-                "warnings": self.safety.warnings,
-                "safety_notes": self.safety.safety_notes
-            },
-            "cooking_information": {
-                "is_edible": self.cooking.is_edible,
-                "preparation_methods": self.cooking.preparation_methods,
-                "cooking_tips": self.cooking.cooking_tips,
-                "contraindications": self.cooking.contraindications
-            },
-            "metadata": {
-                "processing_time": self.metadata.processing_time,
-                "confidence_level": self.metadata.confidence_level,
-                "data_sources": self.metadata.data_sources,
-                "similarity_matches": self.metadata.similarity_matches,
-                "wikipedia_sources": self.metadata.wikipedia_sources
-            },
-            "recommended_action": self.recommended_action,
-            "error_handling": self.error_handling
-        }
-
-class DeviceCapture:
-    """Step 1: 画像入力 - Base64形式変換と取り込み"""
-    
-    def __init__(self):
-        self.device_id = "mobile_device_001"
-        self.supported_formats = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
-
-    def process_input(self, image_path: str, user_question: Optional[str] = None) -> Tuple[str, Optional[str]]:
-        """
-        撮影画像をBase64形式に変換して取り込み
-        
-        Args:
-            image_path: 画像ファイルパス
-            user_question: ユーザーからの質問（オプション）
-            
-        Returns:
-            (base64_image_data, user_question) のタプル
-        """
-        try:
-            # 画像形式チェック
-            if not self._is_supported_format(image_path):
-                raise ValueError(f"サポートされていない画像形式です。対応形式: {self.supported_formats}")
-            
-            # Base64変換（実際の実装ではここで変換処理）
-            # 現在はパスをそのまま返す（シミュレーション）
-            base64_data = self._convert_to_base64(image_path)
-            
-            return base64_data, user_question
-            
-        except Exception as e:
-            # エラー時はパスをそのまま返す
-            return image_path, user_question
-
-    def _is_supported_format(self, image_path: str) -> bool:
-        """画像形式がサポートされているかチェック"""
-        import os
-        _, ext = os.path.splitext(image_path.lower())
-        return ext in self.supported_formats
-
-    def _convert_to_base64(self, image_path: str) -> str:
-        """画像をBase64形式に変換（シミュレーション）"""
-        try:
-            # 実際の実装では以下のような処理
-            # import base64
-            # with open(image_path, 'rb') as image_file:
-            #     base64_data = base64.b64encode(image_file.read()).decode('utf-8')
-            #     return f"data:image/jpeg;base64,{base64_data}"
-            
-            # シミュレーション: パスをそのまま返す
-            return image_path
-            
-        except Exception as e:
-            # フォールバック
-            return image_path
-
-class GemmaClassifier:
-    """Step 2: Gemma3nによる画像解析 - 視覚特徴抽出と候補種生成"""
-    
-    def __init__(self, model, tokenizer, image_db=None):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.image_db = image_db
-
-    def analyze_image(self, image_data: str) -> Tuple[List[SpeciesCandidate], str, np.ndarray]:
-        """
-        画像から視覚特徴を抽出し、上位3種の候補種リストと特徴ベクトルを生成
-        
-        Args:
-            image_data: Base64画像データまたは画像パス
-            
-        Returns:
-            (候補種リスト, 視覚特徴テキスト, 特徴ベクトル)
-        """
-        try:
-            # Step 2a: 強化されたプロンプトで画像分析
-            analysis_prompt = """この画像のキノコを詳細に分析してください。以下の形式で回答してください：
-
-SPECIES_CANDIDATES:
-1. [種名] - Score: [0.XX]
-2. [種名] - Score: [0.XX]  
-3. [種名] - Score: [0.XX]
-
-VISUAL_FEATURES:
-- 傘の形状と色: [詳細記述]
-- 茎の特徴: [詳細記述]
-- ひだ/孔の構造: [詳細記述]
-- サイズ: [詳細記述]
-- 生育環境: [詳細記述]
-- その他の特徴: [詳細記述]"""
-            
-            classification_messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image_data},
-                    {"type": "text", "text": analysis_prompt}
-                ]
-            }]
-            
-            # Gemma3nで分析実行
-            llm_output = do_gemma_3n_inference(classification_messages, max_new_tokens=512)
-            
-            # LLM出力を解析
-            species_candidates, visual_features = self._parse_analysis_output(llm_output)
-            
-            # Step 2b: 特徴ベクトルを抽出
-            feature_vector = self._extract_feature_vector(image_data, visual_features)
-            
-            return species_candidates, visual_features, feature_vector
-            
-        except Exception as e:
-            # フォールバック処理
-            fallback_candidates = [
-                SpeciesCandidate("分析失敗", 0.1),
-                SpeciesCandidate("画像不明瞭", 0.1),
-                SpeciesCandidate("再撮影推奨", 0.1)
-            ]
-            fallback_features = "画像解析に失敗しました。画像を再撮影してください。"
-            fallback_vector = np.zeros(768, dtype=np.float32)
-            return fallback_candidates, fallback_features, fallback_vector
-
-    def _parse_analysis_output(self, llm_output: str) -> Tuple[List[SpeciesCandidate], str]:
-        """LLM出力を解析して種候補と視覚特徴を抽出"""
-        try:
-            species_candidates = []
-            visual_features = ""
-
-            # SPECIES_CANDIDATESセクションを抽出
-            if "SPECIES_CANDIDATES:" in llm_output:
-                species_section = llm_output.split("SPECIES_CANDIDATES:")[1]
-                if "VISUAL_FEATURES:" in species_section:
-                    species_section = species_section.split("VISUAL_FEATURES:")[0]
-                
-                # 各候補を解析
-                import re
-                for line in species_section.strip().split('\n'):
-                    line = line.strip()
-                    if re.match(r'^\d+\.', line):
-                        match = re.search(r'^\d+\.\s*(.+?)\s*-\s*Score:\s*([0-9.]+)', line)
-                        if match:
-                            species_name = match.group(1).strip()
-                            score = float(match.group(2))
-                            species_candidates.append(SpeciesCandidate(species_name, score))
-            
-            # VISUAL_FEATURESセクションを抽出
-            if "VISUAL_FEATURES:" in llm_output:
-                features_section = llm_output.split("VISUAL_FEATURES:")[1]
-                visual_features = features_section.strip()
-            
-            # フォールバック
-            if not species_candidates:
-                species_candidates = [
-                    SpeciesCandidate("不明種A", 0.5),
-                    SpeciesCandidate("不明種B", 0.3),
-                    SpeciesCandidate("不明種C", 0.2)
-                ]
-            
-            if not visual_features:
-                visual_features = "視覚特徴の抽出に失敗しました。"
-            
-            return species_candidates, visual_features
-            
-        except Exception as e:
-            return [
-                SpeciesCandidate("解析エラー", 0.1),
-                SpeciesCandidate("パース失敗", 0.1),
-                SpeciesCandidate("手動識別要", 0.1)
-            ], "エラーが発生しました。"
-
-    def _extract_feature_vector(self, image_data: str, visual_features: str) -> np.ndarray:
-        """画像と視覚特徴から特徴ベクトルを抽出"""
-        try:
-            # Gemma3nの隠れ層から特徴ベクトルを抽出
-            feature_messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image_data},
-                    {"type": "text", "text": f"特徴抽出用: {visual_features[:100]}"}
-                ]
-            }]
-            
-            inputs = self.tokenizer.apply_chat_template(
-                feature_messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt"
-            ).to("cuda")
-            
-            with torch.no_grad():
-                outputs = self.model(**inputs, output_hidden_states=True)
-                # 最後の隠れ層の平均を特徴ベクトルとして使用
-                hidden_states = outputs.hidden_states[-1]
-                feature_vector = hidden_states.mean(dim=1).squeeze().cpu().numpy()
-            
-            return feature_vector.astype(np.float32)
-            
-        except Exception as e:
-            # フォールバック: ランダムベクトル
-            return np.random.normal(0, 1, 768).astype(np.float32)
-
-class CompatibilityEvaluator:
-    """Step 5: 視覚特徴適合性評価 - 各候補種の適合度スコア算出・再ランキング"""
-    
-    def __init__(self):
-        self.compatibility_threshold = 0.6
-    
-    def evaluate_compatibility(self, 
-                             visual_features: str,
-                             similar_images: List[Dict],
-                             wikipedia_morphology: List[Dict],
-                             species_candidates: List[SpeciesCandidate]) -> List[SpeciesCandidate]:
-        """
-        視覚特徴、類似画像、Wikipedia形態情報を突き合わせて適合度スコアを算出
-        
-        Args:
-            visual_features: 画像から抽出した視覚特徴
-            similar_images: 類似検索の結果
-            wikipedia_morphology: Wikipedia形態情報
-            species_candidates: 候補種リスト
-            
-        Returns:
-            再ランキングされた候補種リスト
-        """
-        try:
-            enhanced_candidates = []
-            
-            for candidate in species_candidates:
-                # 基本信頼度
-                base_score = candidate.score
-                
-                # 1. 類似画像適合度評価
-                similarity_boost = self._evaluate_image_similarity(candidate, similar_images)
-                
-                # 2. Wikipedia形態適合度評価
-                morphology_boost = self._evaluate_morphology_match(candidate, visual_features, wikipedia_morphology)
-                
-                # 3. 視覚特徴一貫性評価
-                consistency_boost = self._evaluate_feature_consistency(candidate, visual_features)
-                
-                # 4. 総合適合度スコア計算
-                compatibility_score = min(
-                    base_score + similarity_boost + morphology_boost + consistency_boost,
-                    1.0
-                )
-                
-                enhanced_candidate = SpeciesCandidate(
-                    name=candidate.name,
-                    score=compatibility_score
-                )
-                enhanced_candidates.append(enhanced_candidate)
-            
-            # 適合度スコアで再ランキング
-            ranked_candidates = sorted(enhanced_candidates, key=lambda x: x.score, reverse=True)
-            
-            return ranked_candidates[:3]  # 上位3つを返す
-            
-        except Exception as e:
-            # エラー時は元の候補をそのまま返す
-            return species_candidates
-
-    def _evaluate_image_similarity(self, candidate: SpeciesCandidate, similar_images: List[Dict]) -> float:
-        """類似画像に基づく適合度評価"""
-        boost = 0.0
-        
-        for img in similar_images:
-            img_class = img.get('class', '').lower()
-            candidate_name = candidate.name.lower()
-            similarity_score = img.get('similarity_score', 0.0)
-            
-            # クラス名の部分一致をチェック
-            if any(part in candidate_name for part in img_class.split() if len(part) > 3):
-                boost += similarity_score * 0.1  # 類似度に比例してブースト
-        
-        return min(boost, 0.2)  # 最大0.2のブースト
-
-    def _evaluate_morphology_match(self, candidate: SpeciesCandidate, 
-                                  visual_features: str, wikipedia_docs: List[Dict]) -> float:
-        """Wikipedia形態情報との適合度評価"""
-        boost = 0.0
-        candidate_name = candidate.name.lower()
-        visual_lower = visual_features.lower()
-        
-        for doc in wikipedia_docs:
-            if candidate.name.lower() in doc.get('title', '').lower():
-                content = doc.get('content', '').lower()
-                
-                # 形態学的キーワードマッチング
-                morphology_keywords = ['cap', 'stem', 'gill', 'spore', 'color', 'shape', 'size']
-                visual_keywords = ['傘', '茎', 'ひだ', '胞子', '色', '形', 'サイズ']
-                
-                matches = 0
-                for keyword in morphology_keywords:
-                    if keyword in content and keyword in visual_lower:
-                        matches += 1
-                
-                for keyword in visual_keywords:
-                    if keyword in visual_lower:
-                        matches += 1
-                
-                # マッチ数に基づくブースト
-                boost += min(matches * 0.02, 0.15)
-        
-        return min(boost, 0.15)
-
-    def _evaluate_feature_consistency(self, candidate: SpeciesCandidate, visual_features: str) -> float:
-        """視覚特徴の一貫性評価"""
-        boost = 0.0
-        
-        # 基本的な特徴の存在チェック
-        required_features = ['傘', '茎', 'ひだ', '色']
-        present_features = sum(1 for feature in required_features if feature in visual_features)
-        
-        # 特徴の詳細度評価
-        feature_detail_score = len(visual_features.split()) / 100.0  # 単語数に基づく詳細度
-        
-        boost = min(present_features * 0.02 + feature_detail_score, 0.1)
-        
-        return boost
-
-class CandidateSelector:
-    """Step 6: 最適候補選択 - 最高適合度の種を決定し信頼度を付与"""
-    
-    def __init__(self):
-        self.min_confidence_threshold = 0.3
-        self.high_confidence_threshold = 0.7
-    
-    def select_optimal_candidate(self, ranked_candidates: List[SpeciesCandidate]) -> Tuple[SpeciesCandidate, float]:
-        """
-        最高適合度の種を決定し、信頼度を付与
-        
-        Args:
-            ranked_candidates: 適合度でランキングされた候補種リスト
-            
-        Returns:
-            (最適候補, 信頼度スコア)
-        """
-        if not ranked_candidates:
-            return SpeciesCandidate("候補なし", 0.0), 0.0
-        
-        best_candidate = ranked_candidates[0]
-        
-        # 信頼度スコア計算
-        confidence_score = self._calculate_confidence(best_candidate, ranked_candidates)
-        
-        return best_candidate, confidence_score
-    
-    def _calculate_confidence(self, best_candidate: SpeciesCandidate, 
-                            all_candidates: List[SpeciesCandidate]) -> float:
-        """信頼度スコアを計算"""
-        if len(all_candidates) < 2:
-            return best_candidate.score
-        
-        # 1位と2位の差を考慮
-        score_gap = best_candidate.score - all_candidates[1].score
-        
-        # 基本信頼度
-        base_confidence = best_candidate.score
-        
-        # スコア差によるボーナス
-        gap_bonus = min(score_gap * 0.5, 0.2)
-        
-        # 最終信頼度
-        final_confidence = min(base_confidence + gap_bonus, 1.0)
-        
-        return final_confidence
-
-class RAGQueryBuilder:
-    """RAG用クエリ生成"""
-    
-    def __init__(self, embedding_model):
-        self.embedding_model = embedding_model
-
-    def build_query(self, visual_features: str, species_candidates: List[SpeciesCandidate], 
-                   user_question: Optional[str] = None) -> RAGQuery:
-        """
-        RAG検索用クエリを構築
-        
-        Args:
-            visual_features: 視覚特徴テキスト
-            species_candidates: 種候補リスト
-            user_question: ユーザー質問
-            
-        Returns:
-            RAGQuery オブジェクト
-        """
-        # クエリテキスト構築
-        query_parts = []
-        
-        # 視覚特徴を追加
-        query_parts.append(visual_features)
-        
-        # 上位種候補を追加
-        for candidate in species_candidates[:2]:  # 上位2種のみ
-            query_parts.extend([
-                candidate.name,
-                f"{candidate.name} toxicity edibility",
-                f"{candidate.name} identification features",
-                f"{candidate.name} cooking preparation"
-            ])
-        
-        # ユーザー質問を追加
-        if user_question:
-            query_parts.append(user_question)
-        
-        # 安全性関連キーワードを追加
-        query_parts.extend([
-            "mushroom safety identification",
-            "edible poisonous mushroom differences",
-            "mushroom cooking preparation methods"
-        ])
-        
-        query_text = " ".join(query_parts)
-        
-        # 埋め込みベクトル生成
-        embedding = self.embedding_model.encode([query_text])[0].tolist()
-        
-        rag_query = RAGQuery(text=query_text, embedding=embedding)
-        
-        return rag_query
-
-class ContextFastener:
-    """コンテクストファースナー - 再ランキング + 要約"""
-    
-    def __init__(self, max_context_length: int = 2000):
-        self.max_context_length = max_context_length
-
-    def process(self, documents: List[Document]) -> str:
-        """
-        文書を再ランキングして要約形式に変換
-        
-        Args:
-            documents: 検索結果文書リスト
-            
-        Returns:
-            要約されたコンテクスト文字列
-        """
-        if not documents:
-            return "関連情報が見つかりませんでした。"
-        
-        # 文書を重要度で再ランキング（簡易版）
-        ranked_docs = self._rerank_documents(documents)
-        
-        # プロンプト長制限内に要約
-        condensed_context = self._condense_to_limit(ranked_docs)
-        
-        return condensed_context
-
-    def _rerank_documents(self, documents: List[Document]) -> List[Document]:
-        """文書の再ランキング"""
-        # 安全性情報を優先
-        safety_keywords = ['toxic', 'poisonous', 'edible', 'safety', 'dangerous']
-        
-        def priority_score(doc):
-            content_lower = doc.content.lower()
-            safety_matches = sum(1 for kw in safety_keywords if kw in content_lower)
-            return doc.relevance_score + (safety_matches * 0.1)
-        
-        return sorted(documents, key=priority_score, reverse=True)
-
-    def _condense_to_limit(self, documents: List[Document]) -> str:
-        """文書を制限長に要約"""
-        context_parts = []
-        current_length = 0
-        
-        for i, doc in enumerate(documents):
-            source_info = f"[{doc.metadata['source']}] {doc.metadata.get('title', '')}"
-            doc_summary = f"{source_info}:\n{doc.content[:300]}...\n"
-            
-            if current_length + len(doc_summary) > self.max_context_length:
-                break
-                
-            context_parts.append(doc_summary)
-            current_length += len(doc_summary)
-        
-        return "\n".join(context_parts)
+    """3ステップワークフロー結果"""
+    candidate_species: List[str]
+    similarity_scores: List[float]
+    toxicity_info: Dict[str, Any]
+    cooking_methods: Dict[str, Any]
+    safety_warnings: List[str]
+    final_answer: str
+    recommendation: str
 
 class ImageDatabaseRAG:
     """画像データベースからの類似画像検索システム (Gemma3n使用)"""
@@ -953,16 +385,20 @@ class ImageDatabaseRAG:
     def build_image_index(self, class_names: List[str], paths: List[str], 
                          classes: List[str]):
         """
-        画像データセットからベクトルインデックスを構築（各クラス2枚まで均等サンプリング）
+        画像データセットからベクトルインデックスを構築（各クラス5枚まで均等サンプリング）
         
         Args:
             class_names: クラス名リスト
             paths: 画像パスリスト  
             classes: 各画像のクラス
         """
-        # 各クラスから均等にサンプリング（各クラス2枚まで）
-        images_per_class = 2
+        # 各クラスから均等にサンプリング（各クラス5枚まで）
+        images_per_class = 5
         selected_indices = []
+        
+        print(f"📊 データセット分析:")
+        print(f"   総画像数: {len(classes)}枚")
+        print(f"   総クラス数: {len(class_names)}種類")
         
         # クラス別の画像インデックスを収集し均等サンプリング
         class_indices = {}
@@ -971,20 +407,34 @@ class ImageDatabaseRAG:
                 class_indices[class_name] = []
             class_indices[class_name].append(i)
         
+        print(f"   実際にデータがあるクラス数: {len(class_indices)}種類")
+        
+        # クラス別サンプリング情報を表示
+        sampled_classes = 0
         for class_name in class_indices.keys():
             available = len(class_indices[class_name])
             to_select = min(available, images_per_class)
             if to_select > 0:
                 selected_for_class = random.sample(class_indices[class_name], to_select)
                 selected_indices.extend(selected_for_class)
+                sampled_classes += 1
+                if sampled_classes <= 10:  # 最初の10クラスだけ詳細表示
+                    print(f"   📁 {class_name}: {available}枚中{to_select}枚選択")
+        
+        print(f"   🎯 サンプリング結果: {sampled_classes}クラスから{len(selected_indices)}枚選択")
         
         embeddings = []
         metadata = []
+        total_images = len(selected_indices)
+        
+        print(f"🚀 画像インデックス構築開始: {total_images}枚の画像を処理中...")
         
         for i, idx in enumerate(selected_indices):
             try:
                 image_path = paths[idx]
                 class_name = classes[idx]
+                
+                print(f"📸 [{i+1}/{total_images}] 処理中: {class_name}")
                 
                 # Gemma3nで画像から特徴ベクトルを抽出
                 image_embedding = self._extract_image_features(image_path, class_name)
@@ -997,11 +447,16 @@ class ImageDatabaseRAG:
                         'class_id': class_names.index(class_name) if class_name in class_names else -1,
                         'index': idx
                     })
+                    print(f"✅ 完了: ベクトル次元 {image_embedding.shape}")
+                else:
+                    print(f"❌ 失敗: 特徴ベクトル取得不可")
                 
             except Exception as e:
+                print(f"❌ エラー: {str(e)}")
                 continue
         
         if embeddings:
+            print(f"🔧 FAISSインデックス構築中...")
             self.image_embeddings = np.array(embeddings)
             self.image_metadata = metadata
 
@@ -1013,12 +468,35 @@ class ImageDatabaseRAG:
                 else:
                     # 3次元以上の場合は flatten
                     self.image_embeddings = self.image_embeddings.reshape(len(embeddings), -1)
+            
             # FAISSインデックス構築
             dimension = self.image_embeddings.shape[1]
             self.index = faiss.IndexFlatIP(dimension)
             self.image_embeddings = np.ascontiguousarray(self.image_embeddings, dtype=np.float32)
             faiss.normalize_L2(self.image_embeddings)
             self.index.add(self.image_embeddings)
+            
+            print(f"🎉 FAISSインデックス構築完了!")
+            print(f"   📊 登録画像数: {len(self.image_metadata)}枚")
+            print(f"   📐 ベクトル次元: {dimension}次元")
+            
+            # 登録されたクラスの詳細分析
+            registered_classes = {}
+            for m in self.image_metadata:
+                class_name = m['class']
+                if class_name not in registered_classes:
+                    registered_classes[class_name] = 0
+                registered_classes[class_name] += 1
+            
+            print(f"   🏷️ 登録クラス数: {len(registered_classes)}種類")
+            print(f"   📋 登録クラス詳細:")
+            for i, (class_name, count) in enumerate(registered_classes.items()):
+                if i < 20:  # 最初の20クラスだけ表示
+                    print(f"      {i+1:2d}. {class_name}: {count}枚")
+                elif i == 20:
+                    print(f"      ... 他{len(registered_classes)-20}クラス")
+        else:
+            print(f"❌ 画像インデックス構築失敗: 有効な特徴ベクトルが0個")
 
     def _extract_image_features(self, image_path: str, class_name: str) -> Optional[np.ndarray]:
         """
@@ -1032,6 +510,8 @@ class ImageDatabaseRAG:
             特徴ベクトル (numpy配列)
         """
         try:
+            print(f"🔍 Gemma3nで画像特徴抽出中: {image_path} (クラス: {class_name})")
+            
             # Gemma3nに画像の特徴抽出を依頼
             feature_messages = [{
                 "role": "user",
@@ -1041,8 +521,7 @@ class ImageDatabaseRAG:
                 ]
             }]
             
-            # Gemma3nで特徴テキストを生成（出力をキャプチャしないデモ版）
-            # 実際の実装では出力をキャプチャして処理
+            # Gemma3nで特徴テキストを生成して実際の特徴ベクトルを抽出
             inputs = self.gemma_tokenizer.apply_chat_template(
                 feature_messages,
                 add_generation_prompt=True,
@@ -1058,8 +537,12 @@ class ImageDatabaseRAG:
                 hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
                 feature_vector = hidden_states.mean(dim=1).squeeze().cpu().numpy()  # [hidden_dim]
             
+            print(f"✅ 特徴ベクトル抽出完了: {feature_vector.shape}")
             return feature_vector
+            
         except Exception as e:
+            print(f"⚠️ Gemma3n特徴抽出でエラー発生: {str(e)}")
+            print(f"🔄 フォールバック: 擬似ベクトルを使用 (クラス: {class_name})")
             # フォールバック: クラス名ベースの擬似ベクトル
             return self._create_fallback_vector(class_name)
 
@@ -1096,28 +579,37 @@ class ImageDatabaseRAG:
             return []
 
         try:
+            print(f"🔍 クエリ画像の類似検索開始: {query_image_path}")
+            
             # Gemma3nでクエリ画像の特徴ベクトルを抽出
             query_vector = self._extract_image_features(query_image_path, "query")
             
             if query_vector is None:
+                print(f"❌ クエリ画像の特徴抽出に失敗")
                 return []
             
             # ベクトルを正規化してFAISS用に準備
             query_embedding = query_vector.reshape(1, -1).astype(np.float32)
             faiss.normalize_L2(query_embedding)
             
+            print(f"🔍 FAISSで類似検索実行中: top_{top_k}")
+            
             # 類似画像検索
             scores, indices = self.index.search(query_embedding, top_k)
             
             similar_images = []
-            for score, idx in zip(scores[0], indices[0]):
+            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
                 if idx < len(self.image_metadata):
                     metadata = self.image_metadata[idx].copy()
                     metadata['similarity_score'] = float(score)
                     similar_images.append(metadata)
+                    print(f"  {i+1}. {metadata['class']} (類似度: {score:.3f})")
             
+            print(f"✅ 類似検索完了: {len(similar_images)}件の結果")
             return similar_images
+            
         except Exception as e:
+            print(f"❌ 類似検索エラー: {str(e)}")
             return []
 
     def get_class_examples(self, class_name: str, max_examples: int = 3) -> List[Dict]:
@@ -1138,241 +630,20 @@ class ImageDatabaseRAG:
         
         return examples
 
-class GemmaGenerator:
-    """Gemma3n 生成ヘッド - 最終回答生成"""
-    
-    def __init__(self, model, tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer
-
-    def generate_final_answer(self, species_candidates: List[SpeciesCandidate], 
-                            visual_features: str, condensed_context: str,
-                            user_question: Optional[str] = None) -> WorkflowResult:
-        """
-        最終的な回答を生成（危険度・可食可否・調理提案）
-        
-        Args:
-            species_candidates: 種候補リスト
-            visual_features: 視覚特徴
-            condensed_context: 要約されたコンテクスト
-            user_question: ユーザー質問
-            
-        Returns:
-            WorkflowResult オブジェクト
-        """
-        # 候補種をテキスト形式に変換
-        candidates_text = "\n".join([
-            f"- {c.name} (信頼度: {c.score:.2f})" 
-            for c in species_candidates
-        ])
-        
-        # 最終回答生成用プロンプト
-        generation_prompt = f"""
-キノコ同定とリスク評価:
-
-観察特徴: {visual_features}
-AI候補: {candidates_text}
-文献情報: {condensed_context}
-{f"質問: {user_question}" if user_question else ""}
-
-回答形式:
-## 種類推定
-[最有力種とその理由]
-## 安全性評価  
-[危険度(1-5), 可食性, 注意事項]
-## 取り扱い提案
-[調理法または廃棄方法]
-## 信頼度評価
-[判定信頼度(1-10)]
-
-【重要】専門家確認なしでの摂取は禁止。
-"""
-        
-        # Gemma3nで最終回答生成
-        final_messages = [{
-            "role": "user", 
-            "content": [{"type": "text", "text": generation_prompt}]
-        }]
-        
-        final_output = do_gemma_3n_inference(final_messages, max_new_tokens=1024)
-        
-        # LLM出力から信頼度を抽出
-        confidence_score = self._extract_confidence_from_output(final_output, species_candidates)
-        
-        # フォローアップアクション決定
-        followup_action = self._determine_followup_action(confidence_score, species_candidates)
-        
-        # 実際のLLM出力を最終回答として使用
-        final_answer = final_output
-        
-        result = WorkflowResult(
-            final_answer=final_answer,
-            confidence_score=confidence_score,
-            followup_action=followup_action
-        )
-        
-        return result
-
-    def _extract_confidence_from_output(self, llm_output: str, species_candidates: List[SpeciesCandidate]) -> float:
-        """LLM出力から信頼度スコアを抽出"""
-        try:
-            # "信頼度（1-10）" の数値を抽出
-            import re
-            confidence_match = re.search(r'信頼度[：:]\s*(\d+(?:\.\d+)?)', llm_output)
-            if confidence_match:
-                # 1-10スケールを0-1スケールに変換
-                confidence_raw = float(confidence_match.group(1))
-                confidence_score = min(confidence_raw / 10.0, 1.0)
-            else:
-                # 信頼度が見つからない場合は候補の最高スコアに基づく
-                confidence_score = min(species_candidates[0].score + 0.1, 0.95) if species_candidates else 0.3
-                
-            return confidence_score
-        except Exception as e:
-            # フォールバック: 候補の最高スコアに基づく
-            return min(species_candidates[0].score + 0.1, 0.95) if species_candidates else 0.3
-
-    def _determine_followup_action(self, confidence: float, candidates: List[SpeciesCandidate]) -> Optional[str]:
-        """フォローアップアクション決定"""
-        if confidence < 0.5:
-            return "信頼度が低いため、必ず専門家に相談してください。追加の角度からの写真撮影を推奨します。"
-        elif confidence < 0.7:
-            return "より詳細な写真（ひだ・柄の断面・胞子痕）の撮影を推奨します。"
-        elif any(c.name.lower() in ['amanita', 'destroying angel', 'death cap'] for c in candidates):
-            return "毒性の高い種類の可能性があります。絶対に摂取せず、専門家に確認してください。"
-        else:
-            return "比較的信頼性の高い識別ですが、最終判断は専門家に委ねてください。"
 
 class MobileMushroomWorkflow:
-    """モバイル端末向けキノコ識別ワークフロー統合クラス"""
+    """モバイル端末向けキノコ識別ワークフロー統合クラス - 3ステップ版"""
     
     def __init__(self, model, tokenizer, embedding_model):
-        # 10ステップワークフロー用コンポーネント初期化
+        # 3ステップワークフロー用コンポーネント初期化
         
-        # Step 1: 画像入力
-        self.device_capture = DeviceCapture()
+        # Step 1: 画像マッチング
+        self.image_db = ImageDatabaseRAG("dataset", model, tokenizer)
         
-        # Step 2: 画像解析
-        self.gemma_classifier = GemmaClassifier(model, tokenizer)
-        
-        # Step 3: 画像類似検索
-        self.image_db = None  # 後で初期化
-        
-        # Step 4: Wikipedia検索
-        self.knowledge_bases = self._initialize_knowledge_bases('all-MiniLM-L6-v2')
-        
-        # Step 5: 視覚特徴適合性評価
-        self.compatibility_evaluator = CompatibilityEvaluator()
-        
-        # Step 6: 最適候補選択
-        self.candidate_selector = CandidateSelector()
-        
-        # Step 7: 安全性・調理情報検索（WikipediaRAG）
-        # knowledge_basesを流用
-        
-        # Step 8: 情報要約・統合
-        self.context_fastener = ContextFastener(max_context_length=1000)  # 1000字制限
-        
-        # Step 9: 最終回答生成
-        self.gemma_generator = GemmaGenerator(model, tokenizer)
-        
-        # その他
-        self.rag_query_builder = RAGQueryBuilder(embedding_model)
+        # Step 2: Wikipedia検索
+        self.wikipedia_rag = WikipediaRAG('all-MiniLM-L6-v2')
 
-    def _initialize_knowledge_bases(self, embedding_model_name='all-MiniLM-L6-v2') -> Dict[str, WikipediaRAG]:
-        """汎用的なRAGシステムを初期化"""
-        # 汎用的な動的検索ベース
-        universal_rag = WikipediaRAG(embedding_model=embedding_model_name)
-        knowledge_bases = {
-            "field_guides": universal_rag,
-            "toxicity_reports": universal_rag, 
-            "cooking_recipes": universal_rag
-        }
-        
-        return knowledge_bases
 
-    def display_detailed_results(self, result: WorkflowResult):
-        """
-        10ステップワークフロー結果の詳細表示（JSON構造対応）
-        
-        Args:
-            result: 10ステップWorkflowResult
-        """
-        print("=" * 80)
-        print("🍄 10ステップキノコ識別ワークフロー - 詳細結果")
-        print("=" * 80)
-        
-        # 1. 処理情報とメタデータ
-        print(f"\n📊 処理情報:")
-        print(f"  ⏱️  処理時間: {result.metadata.processing_time:.2f}秒")
-        print(f"  🌐 データソース: {', '.join(result.metadata.data_sources)}")
-        print(f"  📚 Wikipedia検索: {result.metadata.wikipedia_sources}件")
-        print(f"  🔍 類似画像: {result.metadata.similarity_matches}件")
-        print(f"  📈 信頼度レベル: {result.metadata.confidence_level}")
-        
-        # 2. 識別結果
-        print(f"\n🔬 種の識別結果:")
-        print(f"  🏷️  種名: {result.identification.species_name}")
-        confidence_percentage = result.identification.confidence_score * 100
-        compatibility_percentage = result.identification.compatibility_score * 100
-        
-        # 信頼度バー
-        confidence_bar = "█" * int(result.identification.confidence_score * 10) + "░" * (10 - int(result.identification.confidence_score * 10))
-        compatibility_bar = "█" * int(result.identification.compatibility_score * 10) + "░" * (10 - int(result.identification.compatibility_score * 10))
-        
-        print(f"  📈 信頼度: {confidence_percentage:.1f}% [{confidence_bar}]")
-        print(f"  ⚖️  適合度: {compatibility_percentage:.1f}% [{compatibility_bar}]")
-        
-        # 3. 視覚特徴
-        print(f"\n👁️  視覚特徴:")
-        features_lines = result.identification.visual_features.split('\n')
-        for line in features_lines[:4]:  # 最初の4行
-            if line.strip():
-                print(f"     {line.strip()}")
-        if len(features_lines) > 4:
-            print(f"     ... (他 {len(features_lines) - 4}項目)")
-        
-        # 4. 安全性評価
-        print(f"\n⚠️  安全性評価:")
-        toxicity_levels = ["", "安全", "注意", "警戒", "危険", "非常に危険"]
-        toxicity_emoji = ["", "🟢", "🟡", "🟠", "🔴", "🔴"]
-        
-        print(f"  {toxicity_emoji[result.safety.toxicity_level]} 毒性レベル: {result.safety.toxicity_level}/5 ({toxicity_levels[result.safety.toxicity_level]})")
-        print(f"  🍽️  可食性: {result.safety.edibility}")
-        print(f"  ⚠️  警告事項: {len(result.safety.warnings)}件")
-        for warning in result.safety.warnings[:2]:  # 最初の2件
-            print(f"     - {warning}")
-        
-        # 5. 調理情報
-        print(f"\n🍳 調理情報:")
-        edible_emoji = "✅" if result.cooking.is_edible else "❌"
-        print(f"  {edible_emoji} 食用可否: {'可能' if result.cooking.is_edible else '不可'}")
-        print(f"  👨‍🍳 調理法: {len(result.cooking.preparation_methods)}種類")
-        for method in result.cooking.preparation_methods[:3]:  # 最初の3つ
-            print(f"     - {method}")
-        
-        # 6. 推奨アクション
-        print(f"\n🎯 推奨アクション:")
-        action_lines = result.recommended_action.split('。')
-        for line in action_lines[:2]:  # 最初の2文
-            if line.strip():
-                print(f"     {line.strip()}。")
-        
-        # 7. エラーハンドリング
-        if result.error_handling:
-            print(f"\n❌ エラー情報:")
-            print(f"     {result.error_handling}")
-        
-        print("\n" + "=" * 80)
-        print("📄 JSON構造化データ:")
-        print("=" * 80)
-        
-        # JSON形式で出力
-        import json
-        json_data = result.to_json_dict()
-        print(json.dumps(json_data, ensure_ascii=False, indent=2))
-        
-        print("=" * 80)
 
     def initialize_image_database(self, image_dataset_path: str, class_names: List[str], 
                                  paths: List[str], classes: List[str]):
@@ -1385,17 +656,17 @@ class MobileMushroomWorkflow:
             paths: 画像パスリスト
             classes: 各画像のクラス
         """
-        # RAGベースアプローチでは画像データベースは簡略化
+        # 3ステップワークフロー用に画像データベース構築
+        self.image_db.build_image_index(class_names, paths, classes)
         print(f"📂 画像データベース情報:")
         print(f"  データセットパス: {image_dataset_path}")
         print(f"  クラス数: {len(class_names)}")
         print(f"  画像数: {len(paths)}")
-        print("  注：RAGベースアプローチでは文献情報を優先します")
 
     def process_image(self, image_path: str, user_question: Optional[str] = None, 
                      verbose: bool = False) -> WorkflowResult:
         """
-        10ステップワークフローを実行
+        3ステップワークフローを実行
         
         Args:
             image_path: 画像ファイルパス
@@ -1403,286 +674,132 @@ class MobileMushroomWorkflow:
             verbose: 進捗表示の有効/無効
             
         Returns:
-            JSON互換のWorkflowResult オブジェクト
+            WorkflowResult オブジェクト
         """
         start_time = time.time()
         
         try:
             if verbose:
-                print("🚀 10ステップキノコ識別ワークフロー開始...")
+                print("🚀 3ステップキノコ識別ワークフロー開始...")
             
-            # Step 1: 画像入力
+            # Step 1: 画像マッチング
             if verbose:
-                print("📷 Step 1: Base64画像変換・取り込み中...")
-            base64_image, processed_question = self.device_capture.process_input(image_path, user_question)
+                print("🔍 Step 1: 画像マッチング中...")
+            similar_images = self.image_db.find_similar_images(image_path, top_k=5)
             
-            # Step 2: 画像解析
+            # 上位類似画像から候補種を抽出
+            candidate_species = [img.get('class', '不明') for img in similar_images[:3]]
+            similarity_scores = [img.get('similarity_score', 0.0) for img in similar_images[:3]]
+            
+            # Step 2: Wikipedia検索
             if verbose:
-                print("🤖 Step 2: Gemma3n画像解析中...")
-            species_candidates, visual_features, feature_vector = self.gemma_classifier.analyze_image(base64_image)
+                print("📚 Step 2: Wikipedia検索中...")
             
-            # Step 3: 画像類似検索
+            # 候補種に基づいてWikipedia検索
+            toxicity_info = {}
+            cooking_methods = {}
+            safety_warnings = []
+            
+            for species in candidate_species:
+                if species != '不明':
+                    # 毒性情報検索
+                    toxicity_query = f"{species} toxicity poisonous edible safety"
+                    toxicity_docs = self.wikipedia_rag.search_wikipedia(toxicity_query, num_results=2)
+                    toxicity_info[species] = toxicity_docs
+                    
+                    # 調理情報検索
+                    cooking_query = f"{species} cooking preparation recipe"
+                    cooking_docs = self.wikipedia_rag.search_wikipedia(cooking_query, num_results=2)
+                    cooking_methods[species] = cooking_docs
+                    
+                    # 安全警告抽出
+                    for doc in toxicity_docs:
+                        content = doc.get('content', '').lower()
+                        if 'toxic' in content or 'poisonous' in content:
+                            safety_warnings.append(f"{species}: 毒性の可能性あり")
+            
+            # Step 3: 回答生成
             if verbose:
-                print("🔍 Step 3: FAISS類似画像検索中...")
-            similar_images = []
-            if self.image_db:
-                similar_images = self.image_db.find_similar_images(base64_image, top_k=3)
+                print("📝 Step 3: 回答生成中...")
             
-            # Step 4: 動的Wikipedia検索
-            if verbose:
-                print("📚 Step 4: Wikipedia動的検索中...")
-            wikipedia_docs = []
-            for kb_name, kb in self.knowledge_bases.items():
-                species_docs = kb.search_species_dynamically(species_candidates, knowledge_base_type=kb_name)
-                wikipedia_docs.extend(species_docs)
+            # 最終回答と推奨アクション生成
+            final_answer = self._generate_answer(candidate_species, toxicity_info, cooking_methods, user_question)
+            recommendation = self._generate_recommendation(candidate_species, safety_warnings)
             
-            # Step 5: 視覚特徴適合性評価
-            if verbose:
-                print("⚖️ Step 5: 適合性評価・再ランキング中...")
-            ranked_candidates = self.compatibility_evaluator.evaluate_compatibility(
-                visual_features, similar_images, wikipedia_docs, species_candidates
-            )
-            
-            # Step 6: 最適候補選択
-            if verbose:
-                print("🎯 Step 6: 最適候補選択中...")
-            best_candidate, final_confidence = self.candidate_selector.select_optimal_candidate(ranked_candidates)
-            
-            # Step 7: 安全性・調理情報検索
-            if verbose:
-                print("⚠️ Step 7: 安全性・調理情報検索中...")
-            safety_docs, cooking_docs = self._search_safety_cooking_info(best_candidate)
-            
-            # Step 8: 情報要約・統合
-            if verbose:
-                print("📝 Step 8: 情報要約・統合中...")
-            all_docs = wikipedia_docs + safety_docs + cooking_docs
-            summarized_context = self.context_fastener.process([
-                Document(content=doc.get('content', ''), metadata=doc, relevance_score=0.8) 
-                for doc in all_docs
-            ])
-            
-            # Step 9: 最終回答生成
-            if verbose:
-                print("💭 Step 9: 構造化回答生成中...")
-            structured_result = self._generate_structured_result(
-                best_candidate, final_confidence, visual_features, 
-                summarized_context, safety_docs, cooking_docs, similar_images
-            )
-            
-            # Step 10: 結果出力
+            # 結果作成
             total_time = time.time() - start_time
-            if verbose:
-                print("📤 Step 10: JSON構造化結果生成中...")
             
-            final_result = self._create_final_workflow_result(
-                structured_result, total_time, len(wikipedia_docs), len(similar_images)
+            result = WorkflowResult(
+                candidate_species=candidate_species,
+                similarity_scores=similarity_scores,
+                toxicity_info=toxicity_info,
+                cooking_methods=cooking_methods,
+                safety_warnings=safety_warnings,
+                final_answer=final_answer,
+                recommendation=recommendation
             )
             
             if verbose:
-                print(f"🎉 10ステップワークフロー完了! (総処理時間: {total_time:.2f}秒)")
+                print(f"🎉 3ステップワークフロー完了! (総処理時間: {total_time:.2f}秒)")
 
-            return final_result
+            return result
             
         except Exception as e:
-            # Step 10: エラーハンドリング
+            # エラーハンドリング
             total_time = time.time() - start_time
             if verbose:
                 print(f"❌ エラーが発生しました: {str(e)}")
             
-            return self._create_error_result(str(e), total_time)
+            return WorkflowResult(
+                candidate_species=["エラー"],
+                similarity_scores=[0.0],
+                toxicity_info={},
+                cooking_methods={},
+                safety_warnings=["システムエラーのため専門家に相談してください"],
+                final_answer=f"エラーが発生しました: {str(e)}",
+                recommendation="システムエラーのため専門家に相談してください"
+            )
 
-    def _search_safety_cooking_info(self, candidate: SpeciesCandidate) -> Tuple[List[Dict], List[Dict]]:
-        """Step 7: 安全性・調理情報の検索"""
-        safety_docs = []
-        cooking_docs = []
+    def _generate_answer(self, candidate_species: List[str], toxicity_info: Dict, 
+                        cooking_methods: Dict, user_question: Optional[str]) -> str:
+        """最終回答を生成"""
+        if not candidate_species or candidate_species[0] == '不明':
+            return "画像からキノコの種類を特定できませんでした。専門家に相談してください。"
         
-        for kb_name, kb in self.knowledge_bases.items():
-            # 安全性検索
-            safety_query = f"{candidate.name} toxicity poisonous edible safety"
-            safety_results = kb.search_wikipedia(safety_query, num_results=2)
-            safety_docs.extend(safety_results)
-            
-            # 調理情報検索
-            cooking_query = f"{candidate.name} cooking preparation recipe culinary"
-            cooking_results = kb.search_wikipedia(cooking_query, num_results=2)
-            cooking_docs.extend(cooking_results)
+        answer = f"上位候補種: {', '.join(candidate_species[:3])}\n\n"
         
-        return safety_docs, cooking_docs
-
-    def _generate_structured_result(self, candidate: SpeciesCandidate, confidence: float,
-                                  visual_features: str, context: str, safety_docs: List[Dict],
-                                  cooking_docs: List[Dict], similar_images: List[Dict]) -> Dict:
-        """Step 9: 構造化回答生成"""
-        # 安全性評価
-        toxicity_level = self._assess_toxicity(candidate, safety_docs)
-        edibility = self._determine_edibility(toxicity_level, safety_docs)
-        warnings = self._extract_warnings(safety_docs)
+        # 安全性情報
+        has_toxicity = any(
+            any('toxic' in doc.get('content', '').lower() or 'poisonous' in doc.get('content', '').lower() 
+                for doc in docs) 
+            for docs in toxicity_info.values()
+        )
+        
+        if has_toxicity:
+            answer += "⚠️ 注意: 毒性の可能性があります。絶対に摂取しないでください。\n\n"
+        else:
+            answer += "ℹ️ 毒性情報は確認できませんでしたが、最終判断は専門家に委ねてください。\n\n"
         
         # 調理情報
-        is_edible = edibility == "edible"
-        prep_methods = self._extract_preparation_methods(cooking_docs)
-        cooking_tips = self._extract_cooking_tips(cooking_docs)
+        if cooking_methods:
+            answer += "🍳 調理情報:\n"
+            for species, docs in cooking_methods.items():
+                if docs:
+                    answer += f"- {species}: 調理法が確認できます\n"
         
-        return {
-            "candidate": candidate,
-            "confidence": confidence,
-            "visual_features": visual_features,
-            "toxicity_level": toxicity_level,
-            "edibility": edibility,
-            "warnings": warnings,
-            "is_edible": is_edible,
-            "prep_methods": prep_methods,
-            "cooking_tips": cooking_tips,
-            "context": context
-        }
-
-    def _create_final_workflow_result(self, structured: Dict, processing_time: float,
-                                    wiki_sources: int, similarity_matches: int) -> WorkflowResult:
-        """Step 10: 最終WorkflowResult作成"""
-        # IdentificationResult
-        identification = IdentificationResult(
-            species_name=structured["candidate"].name,
-            confidence_score=structured["confidence"],
-            compatibility_score=structured["candidate"].score,
-            visual_features=structured["visual_features"]
-        )
+        answer += "\n‼️ 重要: どんなキノコでも、専門家の確認なしでの摂取は危険です。"
         
-        # SafetyAssessment
-        safety = SafetyAssessment(
-            toxicity_level=structured["toxicity_level"],
-            edibility=structured["edibility"],
-            warnings=structured["warnings"],
-            safety_notes=self._generate_safety_notes(structured)
-        )
-        
-        # CookingInformation
-        cooking = CookingInformation(
-            is_edible=structured["is_edible"],
-            preparation_methods=structured["prep_methods"],
-            cooking_tips=structured["cooking_tips"],
-            contraindications=self._extract_contraindications(structured["warnings"])
-        )
-        
-        # ProcessingMetadata
-        confidence_level = "high" if structured["confidence"] > 0.7 else "medium" if structured["confidence"] > 0.4 else "low"
-        metadata = ProcessingMetadata(
-            processing_time=processing_time,
-            confidence_level=confidence_level,
-            data_sources=["Wikipedia", "Gemma3n", "FAISS"],
-            similarity_matches=similarity_matches,
-            wikipedia_sources=wiki_sources
-        )
-        
-        # 推奨アクション
-        recommended_action = self._determine_recommended_action(structured)
-        
-        return WorkflowResult(
-            identification=identification,
-            safety=safety,
-            cooking=cooking,
-            metadata=metadata,
-            recommended_action=recommended_action,
-            # 互換性フィールド
-            final_answer=structured["context"],
-            confidence_score=structured["confidence"],
-            followup_action=recommended_action
-        )
-
-    def _create_error_result(self, error_msg: str, processing_time: float) -> WorkflowResult:
-        """エラー時の結果作成"""
-        identification = IdentificationResult("エラー", 0.0, 0.0, "解析失敗")
-        safety = SafetyAssessment(5, "unknown", ["システムエラー"], "専門家に相談してください")
-        cooking = CookingInformation(False, [], "調理情報取得失敗", ["摂取禁止"])
-        metadata = ProcessingMetadata(processing_time, "error", [], 0, 0)
-        
-        return WorkflowResult(
-            identification=identification,
-            safety=safety,
-            cooking=cooking,
-            metadata=metadata,
-            recommended_action="システムエラーのため専門家に相談してください",
-            error_handling=error_msg
-        )
-
-    def _assess_toxicity(self, candidate: SpeciesCandidate, safety_docs: List[Dict]) -> int:
-        """毒性レベル評価 (1-5)"""
-        # 基本的な毒性評価ロジック
-        candidate_lower = candidate.name.lower()
-        
-        for doc in safety_docs:
-            content = doc.get('content', '').lower()
-            if 'toxic' in content or 'poisonous' in content:
-                return 4
-            elif 'edible' in content and 'safe' in content:
-                return 1
-        
-        return 3  # 不明の場合は中間値
-
-    def _determine_edibility(self, toxicity_level: int, safety_docs: List[Dict]) -> str:
-        """可食性判定"""
-        if toxicity_level <= 2:
-            return "edible"
-        elif toxicity_level >= 4:
-            return "toxic"
+        return answer
+    
+    def _generate_recommendation(self, candidate_species: List[str], safety_warnings: List[str]) -> str:
+        """推奨アクションを生成"""
+        if safety_warnings:
+            return "毒性の可能性があるため、絶対に摂取せず専門家に相談してください。"
+        elif not candidate_species or candidate_species[0] == '不明':
+            return "識別が困難なため、別の角度からの写真を撮影し、専門家に相談してください。"
         else:
-            return "caution"
+            return "毒性情報は確認できませんでしたが、安全のため必ず専門家に確認してから判断してください。"
 
-    def _extract_warnings(self, safety_docs: List[Dict]) -> List[str]:
-        """警告抽出"""
-        warnings = []
-        for doc in safety_docs:
-            content = doc.get('content', '')
-            if 'warning' in content.lower() or 'danger' in content.lower():
-                warnings.append("毒性の可能性があります")
-        return warnings or ["専門家による確認を推奨"]
-
-    def _extract_preparation_methods(self, cooking_docs: List[Dict]) -> List[str]:
-        """調理法抽出"""
-        methods = []
-        for doc in cooking_docs:
-            content = doc.get('content', '').lower()
-            if 'cook' in content:
-                methods.append("加熱調理")
-            if 'boil' in content:
-                methods.append("茹でる")
-        return methods or ["調理情報なし"]
-
-    def _extract_cooking_tips(self, cooking_docs: List[Dict]) -> str:
-        """調理のコツ抽出"""
-        for doc in cooking_docs:
-            content = doc.get('content', '')
-            if len(content) > 50:
-                return content[:200] + "..."
-        return "調理情報が見つかりませんでした"
-
-    def _extract_contraindications(self, warnings: List[str]) -> List[str]:
-        """禁忌事項抽出"""
-        return warnings if warnings else ["専門家による確認必須"]
-
-    def _generate_safety_notes(self, structured: Dict) -> str:
-        """安全性注意事項生成"""
-        confidence = structured["confidence"]
-        if confidence < 0.5:
-            return "信頼度が低いため、必ず専門家に相談してください"
-        elif structured["toxicity_level"] >= 4:
-            return "毒性が疑われます。絶対に摂取しないでください"
-        else:
-            return "最終判断は専門家に委ねてください"
-
-    def _determine_recommended_action(self, structured: Dict) -> str:
-        """推奨アクション決定"""
-        confidence = structured["confidence"]
-        toxicity = structured["toxicity_level"]
-        
-        if toxicity >= 4:
-            return "毒性の可能性が高いため、絶対に摂取せず専門家に確認してください"
-        elif confidence < 0.5:
-            return "信頼度が低いため、追加の写真撮影と専門家相談を推奨します"
-        elif structured["is_edible"]:
-            return "食用可能と思われますが、最終判断は専門家に委ねてください"
-        else:
-            return "詳細な調査が必要です。専門家に相談してください"
 
 #%%
 # モバイルワークフローのテスト実行
@@ -1702,12 +819,11 @@ mobile_workflow = MobileMushroomWorkflow(
 mobile_workflow.initialize_image_database(dir0, class_names, paths, classes)
 
 #%%
-# 10ステップワークフローテスト - 完全版
-print("🧪 10ステップキノコ識別ワークフロー テスト開始")
+# 3ステップワークフローテスト - 簡潔版
+print("🧪 3ステップキノコ識別ワークフロー テスト開始")
 print("=" * 80)
-print("🔟 注：このワークフローは全10ステップを実行します")
-print("   1.画像入力 → 2.画像解析 → 3.類似検索 → 4.Wikipedia検索 → 5.適合性評価")
-print("   → 6.候補選択 → 7.安全性検索 → 8.情報統合 → 9.回答生成 → 10.JSON出力")
+print("3️⃣ 注：このワークフローは3ステップで実行します")
+print("   1.画像マッチング → 2.Wikipedia検索 → 3.回答生成")
 
 # テスト設定
 test_question = "このキノコは食べられますか？"
@@ -1717,16 +833,24 @@ print("=" * 80)
 
 # テスト実行
 try:
-    print("\n🚀 10ステップワークフロー実行開始...")
+    print("\n🚀 3ステップワークフロー実行開始...")
     # 詳細な進捗表示でワークフロー実行
     result = mobile_workflow.process_image(image_path, test_question, verbose=True)
     
     print("\n" + "=" * 80)
-    print("📊 10ステップワークフロー実行結果")
+    print("📊 3ステップワークフロー実行結果")
     print("=" * 80)
     
-    # 新しいJSON構造対応の詳細結果表示
-    mobile_workflow.display_detailed_results(result)
+    # 結果表示
+    print(f"🔬 候補種: {', '.join(result.candidate_species)}")
+    print(f"📈 類似度スコア: {result.similarity_scores}")
+    print(f"⚠️ 安全警告: {len(result.safety_warnings)}件")
+    for warning in result.safety_warnings[:3]:
+        print(f"   - {warning}")
+    print(f"💬 最終回答:")
+    print(f"   {result.final_answer}")
+    print(f"🎯 推奨アクション:")
+    print(f"   {result.recommendation}")
 
 except Exception as e:
     print(f"\n❌ テスト失敗: {str(e)}")
@@ -1734,14 +858,14 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
-print("\n🏁 10ステップテスト完了")
+print("\n🏁 3ステップテスト完了")
 
 #%%
-# 追加テスト: 10ステップ複数質問パターン
+# 追加テスト: 3ステップ複数質問パターン
 print("\n" + "=" * 80)
-print("🔬 10ステップ追加テスト: 複数質問パターン")
+print("🔬 3ステップ追加テスト: 複数質問パターン")
 print("=" * 80)
-print("📊 各テストで全10ステップワークフローを実行し、JSON構造化結果を出力")
+print("📊 各テストで3ステップワークフローを実行し、シンプルな結果を出力")
 
 test_questions = [
     "この種類は何ですか？",
@@ -1751,7 +875,7 @@ test_questions = [
 ]
 
 for i, question in enumerate(test_questions, 1):
-    print(f"\n--- 10ステップテスト {i}/4 ---")
+    print(f"\n--- 3ステップテスト {i}/4 ---")
     print(f"質問: {question if question else '(質問なし)'}")
     
     try:
@@ -1761,41 +885,13 @@ for i, question in enumerate(test_questions, 1):
         execution_time = time.time() - start_time
         
         print(f"✅ 実行成功 (実行時間: {execution_time:.2f}秒)")
-        print(f"   🔬 識別種: {result.identification.species_name}")
-        print(f"   📈 信頼度: {result.identification.confidence_score:.2f}")
-        print(f"   ⚖️  適合度: {result.identification.compatibility_score:.2f}")
-        print(f"   ⚠️  毒性レベル: {result.safety.toxicity_level}/5")
-        print(f"   🍽️  可食性: {result.safety.edibility}")
-        print(f"   🌐 データソース: {len(result.metadata.data_sources)}種類")
-        print(f"   📚 Wikipedia: {result.metadata.wikipedia_sources}件")
-        print(f"   🔍 類似画像: {result.metadata.similarity_matches}件")
-        
-        # 推奨アクションの要約
-        action_summary = result.recommended_action.split('。')[0]
-        print(f"   🎯 推奨: {action_summary}。")
-        
-        # JSON出力サンプル（最初のテストのみ）
-        if i == 1:
-            print(f"\n   📄 JSON出力サンプル（抜粋）:")
-            json_sample = {
-                "identification": {
-                    "species_name": result.identification.species_name,
-                    "confidence_score": result.identification.confidence_score
-                },
-                "safety": {
-                    "toxicity_level": result.safety.toxicity_level,
-                    "edibility": result.safety.edibility
-                },
-                "metadata": {
-                    "processing_time": result.metadata.processing_time,
-                    "confidence_level": result.metadata.confidence_level
-                }
-            }
-            import json
-            print(json.dumps(json_sample, ensure_ascii=False, indent=6))
+        print(f"   🔬 候補種: {result.candidate_species[:2]}")  # 上位2つ
+        print(f"   📈 類似度: {[f'{s:.2f}' for s in result.similarity_scores[:2]]}")
+        print(f"   ⚠️ 警告: {len(result.safety_warnings)}件")
+        print(f"   🎯 推奨: {result.recommendation[:50]}...")
                 
     except Exception as e:
         print(f"❌ 実行失敗: {str(e)}")
 
-print("\n🎯 全10ステップテスト完了")
-print("📊 各テストでJSON互換の構造化結果が正常に生成されました")
+print("\n🎯 全3ステップテスト完了")
+print("📊 各テストでシンプルな構造化結果が正常に生成されました")
