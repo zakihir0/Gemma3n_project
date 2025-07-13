@@ -647,23 +647,57 @@ class ImageDatabaseRAG:
             similar_images: 類似検索結果
             top_n: 表示する類似画像数
         """
-        print(f"\n📊 画像比較結果:")
-        print(f"🎯 テスト画像: {query_image_path}")
-        print(f"📝 ファイル名: {query_image_path.split('/')[-1]}")
-        
-        print(f"\n🔍 類似画像 Top {min(top_n, len(similar_images))}:")
-        for i, img in enumerate(similar_images[:top_n]):
-            similarity_percent = img['similarity_score'] * 100
-            print(f"  {i+1}. {img['class']} (類似度: {similarity_percent:.1f}%)")
-            print(f"     📁 ファイル: {img['path'].split('/')[-1]}")
-            print(f"     🗂️  フルパス: {img['path']}")
+        try:
+            from IPython.display import Image, display
             
-            # 類似度の視覚的表示
-            bar_length = 20
-            filled_length = int(bar_length * img['similarity_score'])
-            bar = '█' * filled_length + '░' * (bar_length - filled_length)
-            print(f"     📊 [{bar}] {similarity_percent:.1f}%")
-            print()
+            print(f"\n📊 画像比較結果:")
+            print(f"🎯 テスト画像: {query_image_path}")
+            print(f"📝 ファイル名: {query_image_path.split('/')[-1]}")
+            
+            # テスト画像を表示
+            try:
+                display(Image(filename=query_image_path, width=300))
+            except Exception as e:
+                print(f"❌ テスト画像表示不可: {str(e)}")
+            
+            print(f"\n🔍 類似画像 Top {min(top_n, len(similar_images))}:")
+            for i, img in enumerate(similar_images[:top_n]):
+                similarity_percent = img['similarity_score'] * 100
+                print(f"\n  {i+1}. {img['class']} (類似度: {similarity_percent:.1f}%)")
+                print(f"     📁 ファイル: {img['path'].split('/')[-1]}")
+                print(f"     🗂️  フルパス: {img['path']}")
+                
+                # 類似度の視覚的表示
+                bar_length = 20
+                filled_length = int(bar_length * img['similarity_score'])
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                print(f"     📊 [{bar}] {similarity_percent:.1f}%")
+                
+                # 類似画像を表示
+                try:
+                    display(Image(filename=img['path'], width=300))
+                except Exception as e:
+                    print(f"     ❌ 画像表示不可: {str(e)}")
+        
+        except ImportError:
+            # IPython.displayが利用できない場合はテキストのみ表示
+            print(f"\n📊 画像比較結果 (テキストのみ):")
+            print(f"🎯 テスト画像: {query_image_path}")
+            print(f"📝 ファイル名: {query_image_path.split('/')[-1]}")
+            
+            print(f"\n🔍 類似画像 Top {min(top_n, len(similar_images))}:")
+            for i, img in enumerate(similar_images[:top_n]):
+                similarity_percent = img['similarity_score'] * 100
+                print(f"  {i+1}. {img['class']} (類似度: {similarity_percent:.1f}%)")
+                print(f"     📁 ファイル: {img['path'].split('/')[-1]}")
+                print(f"     🗂️  フルパス: {img['path']}")
+                
+                # 類似度の視覚的表示
+                bar_length = 20
+                filled_length = int(bar_length * img['similarity_score'])
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                print(f"     📊 [{bar}] {similarity_percent:.1f}%")
+                print()
 
 
 class MobileMushroomWorkflow:
