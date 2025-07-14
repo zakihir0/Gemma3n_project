@@ -1,13 +1,28 @@
 #%%
 # Vision Fine-tuning for Mushroom Classification - CLAUDE.md Based
+
+!pip install --no-deps bitsandbytes accelerate xformers==0.0.29.post3 peft trl triton cut_cross_entropy unsloth_zoo
+!pip install pip3-autoremove
+!pip install torch torchvision torchaudio xformers --index-url https://download.pytorch.org/whl/cu124
+!pip install unsloth
+!pip install faiss-cpu
+!pip install sentence-transformers
+!pip install wikipedia
+!pip install --no-deps git+https://github.com/huggingface/transformers.git
+!pip install --no-deps --upgrade timm
+
+#%%
 import os
 import random
 import pandas as pd
+import json
 from typing import List
 from torchvision import datasets
 from unsloth import FastModel, is_bf16_supported, FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
 
 #%%
 # Load the model (exactly as in CLAUDE.md)
@@ -52,10 +67,21 @@ dataset = []
 for i, (path, class_name) in enumerate(zip(paths, classes)):
     dataset.append({"path": path, "class": class_name})
 
+json_path = f"/kaggle/working/mushroom_dataset.json"
+
+with open(json_path, 'w')as f:
+    json.dump(dataset, f, ensure_ascii=False, indent=2)
+
+#%%
+json_path = f"/kaggle/working/mushroom_dataset.json"
+with open(json_path, 'r') as f:
+    dataset = json.load(f)
+
 # Sample for manageable training
-sample_size = min(100, len(dataset))  # Very small for testing
+sample_size = min(len(dataset), len(dataset))  # Very small for testing
 dataset = random.sample(dataset, sample_size)
 print(f"📊 Using {len(dataset)} samples for training")
+
 
 #%%
 # Convert to conversation format (exactly as in CLAUDE.md)
@@ -83,6 +109,25 @@ print("\n📋 Sample conversation:")
 print(converted_dataset[0])
 
 #%%
+# Split dataset into train and validation
+from sklearn.model_selection import train_test_split
+
+# Extract class labels for stratified split
+class_labels = [sample['messages'][1]['content'][0]['text'] for sample in converted_dataset]
+
+# Split with stratification to maintain class balance
+train_dataset, val_dataset = train_test_split(
+    converted_dataset, 
+    test_size=0.2, 
+    random_state=3407,
+    stratify=class_labels
+)
+
+print(f"📊 Dataset split:")
+print(f"   Training samples: {len(train_dataset)}")
+print(f"   Validation samples: {len(val_dataset)}")
+
+#%%
 # Vision Fine-tuning (exactly as in CLAUDE.md)
 print("\n🚀 Starting Vision Fine-tuning...")
 
@@ -91,10 +136,13 @@ model = FastVisionModel.get_peft_model(
     model,
     finetune_vision_layers = True,
     finetune_language_layers = False,
+    finetune_attention_modules = True,
+    finetune_mlp_modules = True,
     r = 16,  # LoRA rank
     lora_alpha = 32,
-    lora_dropout = 0.1,
+    lora_dropout = 0,  # Changed from 0.1 to 0 for Unsloth compatibility
     bias = "none",
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",],
     random_state = 3407,
     use_gradient_checkpointing = "unsloth",
 )
@@ -102,27 +150,38 @@ model = FastVisionModel.get_peft_model(
 # Enable for training
 FastVisionModel.for_training(model)
 
-# Create trainer (exactly as in CLAUDE.md)
+# Create trainer with validation dataset and evaluation settings
 trainer = SFTTrainer(
     model = model,
     tokenizer = tokenizer,
     data_collator = UnslothVisionDataCollator(model, tokenizer), # Must use!
-    train_dataset = converted_dataset,
+    train_dataset = train_dataset,  # Use split training data
+    eval_dataset = val_dataset,     # Add validation data
     args = SFTConfig(
-        per_device_train_batch_size = 1,  # Reduced for memory
+        per_device_train_batch_size = 5,  # Reduced for memory
+        per_device_eval_batch_size = 5,   # Validation batch size
         gradient_accumulation_steps = 4,
         warmup_steps = 5,
-        max_steps = 10,  # Very short for testing
-        learning_rate = 2e-4,
+        max_steps = 100,  # Very short for testing
+        learning_rate = 1e-4,
         fp16 = not is_bf16_supported(),
         bf16 = is_bf16_supported(),
         logging_steps = 1,
         optim = "adamw_8bit",
         weight_decay = 0.01,
-        lr_scheduler_type = "linear",
+        lr_scheduler_type = "cosine",
         seed = 3407,
         output_dir = "./mushroom_vision_outputs",
         report_to = "none",
+        
+        # Evaluation settings
+        eval_strategy = "steps",         # Evaluate every eval_steps (corrected parameter name)
+        eval_steps = 10,                 # Evaluate every 10 steps
+        save_strategy = "steps",         # Save every save_steps
+        save_steps = 10,                 # Save every 10 steps
+        load_best_model_at_end = True,   # Load best model at end
+        metric_for_best_model = "eval_loss",  # Use eval_loss for best model
+        greater_is_better = False,       # Lower eval_loss is better
 
         # You MUST put the below items for vision finetuning (from CLAUDE.md):
         remove_unused_columns = False,
@@ -178,3 +237,14 @@ print(f"✅ Test completed!")
 print(f"   Test image: {os.path.basename(test_sample['path'])}")
 print(f"   Actual class: {test_sample['class']}")
 print(f"   Model response: {response}")
+# %%
+import torch
+import gc
+
+# del model
+# del trainer
+torch.cuda.empty_cache()
+torch.cuda.ipc_collect()
+gc.collect()
+
+# %%
