@@ -36,7 +36,7 @@ model, tokenizer = FastModel.from_pretrained(
 
 #%%
 # Data loading (simplified)
-dir0 = '/kaggle/input/mushroom1/merged_dataset'
+dir0 = '/notebooks/kaggle/input/mushroom1/merged_dataset'
 max_files_per_class = 50  # Smaller for testing
 
 print("🔄 Loading mushroom dataset...")
@@ -67,13 +67,14 @@ dataset = []
 for i, (path, class_name) in enumerate(zip(paths, classes)):
     dataset.append({"path": path, "class": class_name})
 
-json_path = f"/kaggle/working/mushroom_dataset.json"
+#%%
+json_path = f"/notebooks/kaggle/working/mushroom_dataset.json"
 
 with open(json_path, 'w')as f:
     json.dump(dataset, f, ensure_ascii=False, indent=2)
 
 #%%
-json_path = f"/kaggle/working/mushroom_dataset.json"
+json_path = f"/notebooks/kaggle/working/mushroom_dataset.json"
 with open(json_path, 'r') as f:
     dataset = json.load(f)
 
@@ -173,6 +174,7 @@ trainer = SFTTrainer(
         seed = 3407,
         output_dir = "./mushroom_vision_outputs",
         report_to = "none",
+        deepspeed = None,
         
         # Evaluation settings
         eval_strategy = "steps",         # Evaluate every eval_steps (corrected parameter name)
