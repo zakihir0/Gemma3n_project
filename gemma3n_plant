@@ -1,20 +1,21 @@
 #%%
-# Vision Fine-tuning for Mushroom Classification - CLAUDE.md Based
+# Vision Fine-tuning for plnat Classification - CLAUDE.md Based
 
 !pip install --no-deps bitsandbytes accelerate xformers==0.0.29.post3 peft trl triton cut_cross_entropy unsloth_zoo
 !pip install --upgrade bitsandbytes
 !pip install triton==3.2.0
 !pip install pip3-autoremove
-!pip install torch torchvision torchaudio xformers --index-url https://download.pytorch.org/whl/cu124
+!pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 !pip install unsloth
 !pip install faiss-cpu
 !pip install sentence-transformers
 !pip install wikipedia
 !pip install --no-deps git+https://github.com/huggingface/transformers.git
 !pip install --no-deps --upgrade timm
+!pip uninstall -y deepspeed
+!pip install deepspeed==0.14.4
 !pip install wandb
-!pip uninstall deepspeed -y
-
+!pip install fastai
 
 #%%
 import os
@@ -32,16 +33,13 @@ from IPython.display import display, Image as IPImage
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
 os.environ["WANDB_API_KEY"] = "abd0ce2837eca439d66f6c603136603c1729cd3e"
-os.environ["DEEPSPEED_DISABLE"] = "1"  # Disable DeepSpeed to avoid torch.distributed.elastic conflicts
-os.environ["ACCELERATE_DISABLE_RICH"] = "1"  # Disable rich formatting to avoid conflicts
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable tokenizer parallelism
 
 #%%
 # Initialize WandB with environment variable login
 wandb.login(key=os.getenv("WANDB_API_KEY"))
 
 wandb.init(
-    project="gemma3n-mushroom-classification",
+    project="gemma3n-plant-classification",
     name="vision-finetuning-experiment",
     config={
         "model_name": "unsloth/gemma-3n-E2B-it",
@@ -63,55 +61,71 @@ model, tokenizer = FastModel.from_pretrained(
 )
 
 #%%
-# Data loading (simplified)
-dir0 = '/notebooks/kaggle/input/mushroom1/merged_dataset'
-max_files_per_class = 50  # Smaller for testing
+# Data loading using existing train/valid split
+base_dir = '/notebooks/kaggle/input/new_plant_diseases/2/New Plant Diseases Dataset(Augmented)/New Plant Diseases Dataset(Augmented)'
+train_dir = os.path.join(base_dir, 'train')
+valid_dir = os.path.join(base_dir, 'valid')
 
-print("🔄 Loading mushroom dataset...")
-classes = []
-paths = []
-class_file_counts = {}
+max_files_per_class = 10000  # Smaller for testing
 
-for dirname, _, filenames in os.walk(dir0):
-    class_name = dirname.split('/')[-1]
-    if class_name not in class_file_counts:
-        class_file_counts[class_name] = 0
+def load_dataset_from_dir(root_dir, max_files_per_class=None):
+    """Load dataset from directory with optional file limit per class"""
+    classes = []
+    paths = []
+    class_file_counts = {}
     
-    for filename in filenames:
-        if class_file_counts[class_name] < max_files_per_class:
-            if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
-                full_path = os.path.join(dirname, filename)
-                if os.path.exists(full_path):
-                    classes.append(class_name)
-                    paths.append(full_path)
-                    class_file_counts[class_name] += 1
+    for dirname, _, filenames in os.walk(root_dir):
+        class_name = dirname.split('/')[-1]
+        if class_name == os.path.basename(root_dir):  # Skip root directory
+            continue
+            
+        if class_name not in class_file_counts:
+            class_file_counts[class_name] = 0
+        
+        for filename in filenames:
+            if max_files_per_class is None or class_file_counts[class_name] < max_files_per_class:
+                if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                    full_path = os.path.join(dirname, filename)
+                    if os.path.exists(full_path):
+                        classes.append(class_name)
+                        paths.append(full_path)
+                        class_file_counts[class_name] += 1
+    
+    return classes, paths, class_file_counts
 
-dataset0 = datasets.ImageFolder(root=dir0)
+# Load train and validation datasets separately
+train_classes, train_paths, train_counts = load_dataset_from_dir(train_dir, max_files_per_class)
+val_classes, val_paths, val_counts = load_dataset_from_dir(valid_dir, max_files_per_class)
 
-# Create simple dataset list
-dataset = []
-for i, (path, class_name) in enumerate(zip(paths, classes)):
-    dataset.append({"path": path, "class": class_name})
+# Get unified class names from ImageFolder for consistency
+train_dataset_folder = datasets.ImageFolder(root=train_dir)
+class_names = train_dataset_folder.classes
+print(f"Class names: {class_names}")
+print(f"Number of classes: {len(class_names)}")
 
-json_path = f"/notebooks/kaggle/working/mushroom_dataset.json"
+# Create mapping
+N = list(range(len(class_names)))
+normal_mapping = dict(zip(class_names, N))
+reverse_mapping = dict(zip(N, class_names))
 
-with open(json_path, 'w')as f:
-    json.dump(dataset, f, ensure_ascii=False, indent=2)
+# Create train dataset
+train_dataset = []
+for path, class_name in zip(train_paths, train_classes):
+    train_dataset.append({"path": path, "class": class_name})
 
-#%%
-json_path = f"/notebooks/kaggle/working/mushroom_dataset.json"
-with open(json_path, 'r') as f:
-    dataset = json.load(f)
+# Create validation dataset
+val_dataset = []
+for path, class_name in zip(val_paths, val_classes):
+    val_dataset.append({"path": path, "class": class_name})
 
-# Sample for manageable training
-sample_size = min(len(dataset), len(dataset))  # Very small for testing
-dataset = random.sample(dataset, sample_size)
-print(f"📊 Using {len(dataset)} samples for training")
-
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Train class distribution: {train_counts}")
+print(f"Val class distribution: {val_counts}")
 
 #%%
 # Convert to conversation format (exactly as in CLAUDE.md)
-instruction = "You are an expert of mushroom. Describe accurately what you see in this image."
+instruction = "You are an expert of plant disease. Describe accurately what you see in this image."
 
 def convert_to_conversation(sample):
     try:
@@ -137,33 +151,23 @@ def convert_to_conversation(sample):
         print(f"❌ Error loading image {sample['path']}: {e}")
         return None
 
-converted_dataset = [convert_to_conversation(sample) for sample in dataset]
-# Filter out None values (failed image loads)
-converted_dataset = [item for item in converted_dataset if item is not None]
-print(f"✅ Converted {len(converted_dataset)} samples to conversation format")
+#%%
+# Convert train and validation datasets to conversation format separately
+train_converted_dataset = [convert_to_conversation(sample) for sample in train_dataset]
+train_converted_dataset = [item for item in train_converted_dataset if item is not None]
+print(f"✅ Converted {len(train_converted_dataset)} training samples to conversation format")
+
+val_converted_dataset = [convert_to_conversation(sample) for sample in val_dataset]
+val_converted_dataset = [item for item in val_converted_dataset if item is not None]
+print(f"✅ Converted {len(val_converted_dataset)} validation samples to conversation format")
 
 # Show sample
-print("\n📋 Sample conversation:")
-print(converted_dataset[0])
+print("\n📋 Sample training conversation:")
+print(train_converted_dataset[0])
 
-#%%
-# Split dataset into train and validation
-from sklearn.model_selection import train_test_split
-
-# Extract class labels for stratified split
-class_labels = [sample['messages'][1]['content'][0]['text'] for sample in converted_dataset]
-
-# Split with stratification to maintain class balance
-train_dataset, val_dataset = train_test_split(
-    converted_dataset, 
-    test_size=0.2, 
-    random_state=3407,
-    stratify=class_labels
-)
-
-print(f"📊 Dataset split:")
-print(f"   Training samples: {len(train_dataset)}")
-print(f"   Validation samples: {len(val_dataset)}")
+print(f"\n📊 Final dataset split:")
+print(f"   Training samples: {len(train_converted_dataset)}")
+print(f"   Validation samples: {len(val_converted_dataset)}")
 
 #%%
 # Vision Fine-tuning (exactly as in CLAUDE.md)
@@ -194,8 +198,8 @@ trainer = SFTTrainer(
     model = model,
     tokenizer = tokenizer,
     data_collator = UnslothVisionDataCollator(model, tokenizer), # Must use!
-    train_dataset = train_dataset,  # Use split training data
-    # eval_dataset = val_dataset,     # Remove validation data for simplicity
+    train_dataset = train_converted_dataset,  # Use converted training data
+    eval_dataset = val_converted_dataset,     # Use converted validation data
     args = SFTConfig(
         per_device_train_batch_size = 8,  # Further reduced for stability
         per_device_eval_batch_size = 2,   # Validation batch size
@@ -210,17 +214,20 @@ trainer = SFTTrainer(
         weight_decay = 0.01,
         lr_scheduler_type = "cosine",
         seed = 3407,
-        output_dir = "./mushroom_vision_outputs",
+        output_dir = "./plant_vision_outputs",
         report_to = "wandb",
-        run_name = "gemma3n-mushroom-vision-ft",
-        deepspeed = None,
+        run_name = "gemma3n-plant-vision-ft",
+        use_cpu = False,   # Don't use CPU, stay on GPU
         dataloader_pin_memory = False,  # Disable pin memory to avoid conflicts
         dataloader_num_workers = 0,    # Disable multiprocessing to avoid issues
         
-        # Simplified evaluation settings
-        eval_strategy = "no",            # Disable evaluation to simplify setup
+        # Evaluation settings
+        eval_strategy = "steps",         # Enable evaluation
+        eval_steps = 25,                 # Evaluate every 25 steps
         save_strategy = "steps",         # Save every save_steps
         save_steps = 50,                 # Less frequent saves
+        load_best_model_at_end = True,   # Load best model at end
+        metric_for_best_model = "eval_loss",  # Use eval loss for best model
 
         # You MUST put the below items for vision finetuning (from CLAUDE.md):
         remove_unused_columns = False,
@@ -236,7 +243,7 @@ print("📈 Training started...")
 trainer.train()
 
 print("🎉 Training completed!")
-print(f"💾 Model saved to: ./mushroom_vision_outputs")
+print(f"💾 Model saved to: ./plnat_vision_outputs")
 
 # Log training completion to WandB
 wandb.log({"training_status": "completed"})
@@ -246,8 +253,8 @@ wandb.finish()
 # Test the model
 print("\n🧪 Testing model...")
 
-# Get a test sample and load as PIL Image
-test_sample = dataset[0]
+# Get a test sample and load as PIL Image (use validation dataset)
+test_sample = val_dataset[0]
 test_image = Image.open(test_sample["path"])
 if test_image.mode != 'RGB':
     test_image = test_image.convert('RGB')
@@ -255,7 +262,7 @@ if test_image.mode != 'RGB':
 test_messages = [{
     "role": "user",
     "content": [
-        {"type": "text", "text": "What type of mushroom is this?"},
+        {"type": "text", "text": "What type of plnat is this?"},
         {"type": "image", "image": test_image}
     ]
 }]
@@ -308,14 +315,15 @@ def extract_predicted_class(response_text, available_classes):
     
     return None
 
-class_names = dataset0.classes
+class_names = train_dataset_folder.classes
 predicted_class = extract_predicted_class(response, class_names)
 
 if predicted_class:
     print(f"🔍 Extracted predicted class: {predicted_class}")
     
-    # Find examples of the predicted class
-    predicted_class_samples = [item for item in dataset if item['class'] == predicted_class]
+    # Find examples of the predicted class (from combined dataset)
+    combined_dataset = train_dataset + val_dataset
+    predicted_class_samples = [item for item in combined_dataset if item['class'] == predicted_class]
     
     if predicted_class_samples:
         print(f"\n📚 Reference images for '{predicted_class}' (showing 3 examples):")
@@ -371,12 +379,13 @@ wandb.log(wandb_log_data)
 print("\n🧪 Testing multiple samples from different classes...")
 print("=" * 60)
 
-# Get unique classes and select one sample from each
-unique_classes = list(set([item['class'] for item in dataset]))
+# Get unique classes and select one sample from each (from combined dataset)
+combined_dataset = train_dataset + val_dataset
+unique_classes = list(set([item['class'] for item in combined_dataset]))
 test_samples = []
 
 for class_name in unique_classes[:5]:  # Test first 5 classes
-    class_samples = [item for item in dataset if item['class'] == class_name]
+    class_samples = [item for item in combined_dataset if item['class'] == class_name]
     if class_samples:
         test_samples.append(random.choice(class_samples))
 
@@ -400,7 +409,7 @@ for i, sample in enumerate(test_samples, 1):
     messages = [{
         "role": "user",
         "content": [
-            {"type": "text", "text": "What type of mushroom is this?"},
+            {"type": "text", "text": "What type of plnat is this?"},
             {"type": "image", "image": test_img}
         ]
     }]
@@ -433,7 +442,7 @@ for i, sample in enumerate(test_samples, 1):
     
     if predicted_class:
         print(f"🔍 Extracted class: {predicted_class}")
-        predicted_class_samples = [item for item in dataset if item['class'] == predicted_class]
+        predicted_class_samples = [item for item in combined_dataset if item['class'] == predicted_class]
         
         if predicted_class_samples and len(predicted_class_samples) > 0:
             print(f"📚 Reference examples for '{predicted_class}':")
