@@ -1,6 +1,8 @@
 #%%
 # Vision Fine-tuning for plnat Classification - CLAUDE.md Based
 
+!pip uninstall -y pygobject gradient gradient-utils
+!pip install --no-cache-dir --upgrade packaging==24.2
 !pip install --no-deps bitsandbytes accelerate xformers==0.0.29.post3 peft trl triton cut_cross_entropy unsloth_zoo
 !pip install --upgrade bitsandbytes
 !pip install triton==3.2.0
@@ -14,8 +16,7 @@
 !pip install --no-deps --upgrade timm
 !pip uninstall -y deepspeed
 !pip install deepspeed==0.14.4
-!pip install wandb
-!pip install fastai
+!pip install wandb==0.17.9
 
 #%%
 import os
@@ -23,6 +24,7 @@ import random
 import pandas as pd
 import json
 from typing import List
+from collections import defaultdict
 from torchvision import datasets
 from unsloth import FastModel, is_bf16_supported, FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
@@ -45,9 +47,18 @@ wandb.init(
         "model_name": "unsloth/gemma-3n-E2B-it",
         "max_seq_length": 1024,
         "load_in_4bit": True,
-        "max_files_per_class": 50,
-        "lora_rank": 16,
-        "lora_alpha": 32,
+        "max_files_per_class_train": 10000,
+        "max_files_per_class_val": 50,
+        "max_val_samples_for_sft": 200,
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "learning_rate": 1e-4,
+        "max_steps": 100,
+        "eval_steps": 10,
+        "logging_steps": 1,
+        "per_device_train_batch_size": 8,
+        "per_device_eval_batch_size": 16,
+        "gradient_accumulation_steps": 8,
     }
 )
 
@@ -66,7 +77,13 @@ base_dir = '/notebooks/kaggle/input/new_plant_diseases/2/New Plant Diseases Data
 train_dir = os.path.join(base_dir, 'train')
 valid_dir = os.path.join(base_dir, 'valid')
 
-max_files_per_class = 10000  # Smaller for testing
+# Dataset size configuration
+max_files_per_class_train = 10000  # Training data limit
+max_files_per_class_val = 50       # Validation data limit (small for faster evaluation)
+
+print(f"📊 Dataset configuration:")
+print(f"   Training: max {max_files_per_class_train} files per class")
+print(f"   Validation: max {max_files_per_class_val} files per class")
 
 def load_dataset_from_dir(root_dir, max_files_per_class=None):
     """Load dataset from directory with optional file limit per class"""
@@ -93,9 +110,9 @@ def load_dataset_from_dir(root_dir, max_files_per_class=None):
     
     return classes, paths, class_file_counts
 
-# Load train and validation datasets separately
-train_classes, train_paths, train_counts = load_dataset_from_dir(train_dir, max_files_per_class)
-val_classes, val_paths, val_counts = load_dataset_from_dir(valid_dir, max_files_per_class)
+# Load train and validation datasets separately with different limits
+train_classes, train_paths, train_counts = load_dataset_from_dir(train_dir, max_files_per_class_train)
+val_classes, val_paths, val_counts = load_dataset_from_dir(valid_dir, max_files_per_class_val)
 
 # Get unified class names from ImageFolder for consistency
 train_dataset_folder = datasets.ImageFolder(root=train_dir)
@@ -124,8 +141,358 @@ print(f"Train class distribution: {train_counts}")
 print(f"Val class distribution: {val_counts}")
 
 #%%
-# Convert to conversation format (exactly as in CLAUDE.md)
-instruction = "You are an expert of plant disease. Describe accurately what you see in this image."
+# Add special tokens for plant classes
+print(f"\n🏷️ Adding special tokens for {len(class_names)} plant classes...")
+print(f"🔍 Investigating tokenizer type: {type(tokenizer)}")
+
+# Check tokenizer attributes
+print(f"📋 Available tokenizer attributes: {[attr for attr in dir(tokenizer) if not attr.startswith('_')]}")
+
+# STEP 1: Investigate current vocabulary structure and token ID ranges
+print(f"\n🔬 DETAILED VOCABULARY ANALYSIS")
+print("=" * 60)
+
+# Check base vocabulary size
+if hasattr(tokenizer, 'tokenizer'):
+    actual_tokenizer = tokenizer.tokenizer
+    base_vocab_size = len(actual_tokenizer)
+    print(f"📊 Base vocabulary size (underlying tokenizer): {base_vocab_size}")
+else:
+    base_vocab_size = len(tokenizer)
+    actual_tokenizer = tokenizer
+    print(f"📊 Base vocabulary size (direct tokenizer): {base_vocab_size}")
+
+# Investigate model configuration for multimodal embeddings
+print(f"\n🧠 Model Configuration Analysis:")
+if hasattr(model, 'config'):
+    config = model.config
+    print(f"   Model type: {getattr(config, 'model_type', 'Unknown')}")
+        
+    # Check for multimodal specific configurations
+    text_config = getattr(config, 'text_config', None)
+    if text_config:
+        print(f"   Text vocab size: {getattr(text_config, 'vocab_size', 'Not found')}")
+        print(f"   Text vocab offset: {getattr(text_config, 'vocab_offset', 'Not found')}")
+
+    audio_config = getattr(config, 'audio_config', None)
+    if audio_config:
+        print(f"   Audio vocab size: {getattr(audio_config, 'vocab_size', 'Not found')}")
+        print(f"   Audio vocab offset: {getattr(audio_config, 'vocab_offset', 'Not found')}")
+    
+    vision_config = getattr(config, 'vision_config', None)
+    if vision_config:
+        print(f"   Vision vocab size: {getattr(vision_config, 'vocab_size', 'Not found')}")
+        print(f"   Vision vocab offset: {getattr(vision_config, 'vocab_offset', 'Not found')}")
+
+# Check for special token ranges in current tokenizer
+print(f"\n🎯 Special Token Investigation:")
+if hasattr(actual_tokenizer, 'all_special_tokens'):
+    existing_special_tokens = actual_tokenizer.all_special_tokens
+    print(f"   Existing special tokens: {len(existing_special_tokens)}")
+    print(f"   Examples: {existing_special_tokens[:10]}")
+    
+    # Get IDs of existing special tokens
+    if existing_special_tokens:
+        special_token_ids = [actual_tokenizer.convert_tokens_to_ids(token) for token in existing_special_tokens[:5]]
+        print(f"   Special token ID examples: {special_token_ids}")
+        print(f"   Special token ID range: {min(special_token_ids) if special_token_ids else 'N/A'} - {max(special_token_ids) if special_token_ids else 'N/A'}")
+
+# Sample some token IDs to understand the vocabulary layout
+print(f"\n🔍 Token ID Sampling:")
+sample_tokens = ['<', '>', 'plant', 'class', 'the', 'a']
+for token in sample_tokens:
+    try:
+        token_id = actual_tokenizer.convert_tokens_to_ids(token)
+        print(f"   '{token}' → ID: {token_id}")
+    except:
+        print(f"   '{token}' → Not found")
+
+# Test a range of high token IDs to find safe ranges
+print(f"\n🎲 High Token ID Range Test:")
+test_ranges = [base_vocab_size - 10, base_vocab_size, base_vocab_size + 100, base_vocab_size + 1000]
+for test_id in test_ranges:
+    try:
+        if test_id < len(actual_tokenizer):
+            token = actual_tokenizer.convert_ids_to_tokens(test_id)
+            print(f"   ID {test_id}: '{token}'")
+        else:
+            print(f"   ID {test_id}: Out of range (max: {len(actual_tokenizer)-1})")
+    except:
+        print(f"   ID {test_id}: Error accessing")
+
+special_tokens = [f"<PLANT_CLASS_{i}>" for i in range(len(class_names))]
+print(f"\n📋 Planned special tokens: {len(special_tokens)} tokens")
+print(f"   Will be added to range: {base_vocab_size} - {base_vocab_size + len(special_tokens) - 1}")
+
+# SAFETY CHECK: Ensure we're not conflicting with known ranges
+print(f"\n⚠️  SAFETY ANALYSIS:")
+if base_vocab_size + len(special_tokens) > 300000:  # Reasonable upper bound
+    print(f"   ❌ WARNING: New vocab size would be {base_vocab_size + len(special_tokens)}, which seems too large")
+    print(f"   🔄 Consider reducing number of classes or using different approach")
+else:
+    print(f"   ✅ New vocab size {base_vocab_size + len(special_tokens)} appears reasonable")
+
+# STEP 2: Safe special token addition with conflict avoidance
+print(f"\n🔧 SAFE SPECIAL TOKEN ADDITION")
+print("=" * 60)
+
+try:
+    # Check if we should proceed based on safety analysis
+    if base_vocab_size + len(special_tokens) > 300000:
+        raise ValueError(f"Vocabulary would become too large: {base_vocab_size + len(special_tokens)}")
+    
+    # Store original vocab size for verification
+    original_vocab_size = len(actual_tokenizer)
+    print(f"📊 Original vocabulary size: {original_vocab_size}")
+    
+    # Step 1: Add special tokens to the underlying tokenizer first
+    if hasattr(tokenizer, 'tokenizer'):
+        print("🔧 Found tokenizer.tokenizer - using underlying tokenizer")
+        
+        # Use add_special_tokens for proper special token handling
+        num_added = actual_tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+        print(f"✅ Added {num_added} special tokens to underlying tokenizer")
+        
+        # Verify the token IDs are in safe range
+        new_vocab_size = len(actual_tokenizer)
+        print(f"📊 New vocabulary size: {new_vocab_size}")
+        
+        # Check token ID assignments
+        added_token_ids = []
+        for token in special_tokens:
+            token_id = actual_tokenizer.convert_tokens_to_ids(token)
+            added_token_ids.append(token_id)
+        
+        print(f"🎯 Added token ID range: {min(added_token_ids)} - {max(added_token_ids)}")
+        
+        # CRITICAL: Check if any new token IDs conflict with known ranges
+        conflict_detected = False
+        
+        # Check for low-range conflicts (0-127 = audio range from error)
+        low_range_conflicts = [tid for tid in added_token_ids if tid < 128]
+        if low_range_conflicts:
+            print(f"❌ CONFLICT DETECTED: Token IDs in audio range (0-127): {low_range_conflicts}")
+            conflict_detected = True
+        
+        # Check for unexpected ID patterns
+        if max(added_token_ids) < original_vocab_size:
+            print(f"❌ CONFLICT DETECTED: New tokens assigned to existing vocab range")
+            conflict_detected = True
+        
+        if conflict_detected:
+            print(f"🔄 Conflict detected, removing added tokens and falling back...")
+            # Note: Cannot easily remove tokens, so we'll fall back to text classification
+            raise ValueError("Token ID conflicts detected")
+        
+        # Step 2: Resize model embeddings with extra safety checks
+        print(f"🔄 Resizing model embeddings from {original_vocab_size} to {new_vocab_size}...")
+        try:
+            model.resize_token_embeddings(new_vocab_size)
+            print("✅ Successfully resized model embeddings")
+            
+            # Verify resize worked
+            if hasattr(model, 'get_input_embeddings'):
+                embedding_size = model.get_input_embeddings().num_embeddings
+                print(f"📊 Model embedding size after resize: {embedding_size}")
+                if embedding_size != new_vocab_size:
+                    print(f"⚠️ Warning: Embedding size mismatch ({embedding_size} vs {new_vocab_size})")
+            
+        except Exception as resize_e:
+            print(f"❌ Resize error: {resize_e}")
+            raise resize_e
+        
+        vocab_size = new_vocab_size
+        print("✅ Successfully added tokens via underlying tokenizer")
+    
+    # Fallback options if tokenizer.tokenizer is not available
+    elif hasattr(tokenizer, 'add_special_tokens'):
+        print("🔧 Using direct add_special_tokens")
+        num_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+        print(f"✅ Added {num_added} special tokens")
+        model.resize_token_embeddings(len(tokenizer))
+        vocab_size = len(tokenizer)
+        print("✅ Successfully added tokens via add_special_tokens")
+    
+    elif hasattr(tokenizer, 'add_tokens'):
+        print("🔧 Using tokenizer.add_tokens method")
+        num_added = tokenizer.add_tokens(special_tokens)
+        print(f"✅ Added {num_added} tokens")
+        model.resize_token_embeddings(len(tokenizer))
+        vocab_size = len(tokenizer)
+        print("✅ Successfully added tokens via add_tokens")
+    
+    else:
+        raise AttributeError("No suitable method found for adding tokens")
+        
+except Exception as e:
+    print(f"❌ Error adding special tokens: {e}")
+    print("🔄 Falling back to text-based classification...")
+    
+    # Fallback: Use text-based approach instead
+    special_tokens = None
+    vocab_size = None
+    
+    print(f"\n📝 FALLBACK MODE ACTIVATED")
+    print(f"   Reason: {str(e)}")
+    print(f"   Will use class names directly instead of special tokens")
+
+# Create bidirectional mapping between class names and special tokens (if successful)
+if special_tokens is not None:
+    class_to_token = {class_name: special_tokens[i] for i, class_name in enumerate(class_names)}
+    token_to_class = {special_tokens[i]: class_name for i, class_name in enumerate(class_names)}
+    
+    print(f"✅ Added {len(special_tokens)} special tokens")
+    print(f"📊 Tokenizer vocabulary size: {vocab_size}")
+    print(f"🔗 Example mappings:")
+    for i, (class_name, token) in enumerate(list(class_to_token.items())[:3]):
+        print(f"   {class_name} → {token}")
+    print("   ...")
+    
+    # Log special tokens configuration to WandB
+    wandb.log({
+        "config/num_special_tokens": len(special_tokens),
+        "config/vocab_size_after_tokens": vocab_size,
+        "config/example_tokens": special_tokens[:5],
+        "config/approach": "special_tokens"
+    })
+else:
+    # Fallback: Use text-based classification with class names
+    class_to_token = {class_name: class_name for class_name in class_names}  # Identity mapping
+    token_to_class = {class_name: class_name for class_name in class_names}  # Identity mapping
+    
+    print(f"⚠️ Using fallback text-based classification")
+    print(f"📝 Will train model to output class names directly")
+    
+    # Log fallback configuration to WandB
+    wandb.log({
+        "config/num_classes": len(class_names),
+        "config/approach": "text_classification",
+        "config/fallback_reason": "special_tokens_not_supported"
+    })
+
+#%%
+# ========== VOCABULARY OFFSET PATCH ==========
+print("\n🔧 APPLYING VOCABULARY OFFSET PATCH...")
+print("=" * 60)
+
+# Import torch for tensor operations
+import torch
+
+# 現在の設定を確認
+current_text_vocab = len(tokenizer) if hasattr(tokenizer, '__len__') else len(actual_tokenizer)
+original_text_vocab = 262400  # Gemma3nの元サイズ
+audio_vocab_size = 128
+vision_vocab_size = 128
+
+print(f"📊 Vocabulary Status:")
+print(f"   Original text vocab: {original_text_vocab}")
+print(f"   Current text vocab: {current_text_vocab}")
+print(f"   Audio vocab: {audio_vocab_size}")
+print(f"   Vision vocab: {vision_vocab_size}")
+
+# 正しいオフセット計算
+new_text_vocab_offset = 0
+new_audio_vocab_offset = current_text_vocab
+new_vision_vocab_offset = current_text_vocab + audio_vocab_size
+total_vocab_size = current_text_vocab + audio_vocab_size + vision_vocab_size
+
+print(f"\n🎯 Corrected Offsets:")
+print(f"   Text vocab offset: {new_text_vocab_offset} - {new_audio_vocab_offset-1}")
+print(f"   Audio vocab offset: {new_audio_vocab_offset} - {new_vision_vocab_offset-1}")
+print(f"   Vision vocab offset: {new_vision_vocab_offset} - {total_vocab_size-1}")
+
+# モデル設定を更新
+if hasattr(model, 'config'):
+    model.config.text_vocab_offset = new_text_vocab_offset
+    model.config.audio_vocab_offset = new_audio_vocab_offset
+    model.config.vision_vocab_offset = new_vision_vocab_offset
+    model.config.total_vocab_size = total_vocab_size
+    print("✅ Model config updated with corrected offsets")
+
+# 推論関数をパッチ（後で使用）
+def do_gemma_3n_inference_safe(messages, max_new_tokens=128):
+    """安全な推論関数 - token ID範囲チェック付き"""
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to("cuda")
+    
+    # Token ID範囲チェック
+    input_ids = inputs['input_ids']
+    max_token_id = input_ids.max().item()
+    
+    if max_token_id >= total_vocab_size:
+        print(f"⚠️  Token ID {max_token_id} >= total_vocab_size {total_vocab_size}, clamping...")
+        inputs['input_ids'] = torch.clamp(input_ids, 0, total_vocab_size - 1)
+    
+    try:
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=1.0, top_p=0.95, top_k=64,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+        response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+        return response_text
+    except Exception as e:
+        print(f"❌ Generation error: {e}")
+        return f"[Error: {str(e)}]"
+
+print("✅ Patched inference function created")
+
+# WandBにオフセット修正情報をログ
+wandb.log({
+    "vocab_patch/original_text_vocab": original_text_vocab,
+    "vocab_patch/current_text_vocab": current_text_vocab,
+    "vocab_patch/new_audio_offset": new_audio_vocab_offset,
+    "vocab_patch/new_vision_offset": new_vision_vocab_offset,
+    "vocab_patch/total_vocab_size": total_vocab_size,
+    "vocab_patch/patch_applied": True
+})
+print("📊 Vocabulary offset patch info logged to WandB")
+print("=" * 60)
+
+#%%
+# Convert to conversation format with adaptive approach
+# Create structured instruction based on approach used
+if special_tokens is not None:
+    # Special token approach
+    token_list_str = "\n".join([f"- {class_names[i]} → {special_tokens[i]}" for i in range(len(class_names))])
+    
+    instruction = f"""You are an expert plant disease classifier. 
+Analyze the image and respond with ONLY the corresponding special token:
+
+{token_list_str}
+
+IMPORTANT: 
+- Return exactly one special token from the mappings above
+- Use the exact token format: <PLANT_CLASS_N>
+- Do not add any explanation or additional text
+- Example response: <PLANT_CLASS_5>"""
+    
+    print(f"📝 Instruction created with {len(class_names)} classes mapping to special tokens")
+
+else:
+    # Text-based approach (fallback)
+    class_list_str = "\n".join([f"- {cls}" for cls in class_names])
+    
+    instruction = f"""You are an expert plant disease classifier. 
+Analyze the image and respond with ONLY the exact class name from this list:
+
+{class_list_str}
+
+IMPORTANT: 
+- Return exactly one class name from the list above
+- Use the exact format shown (including underscores if present)
+- Do not add any explanation or additional text
+- Example response: "Apple_Black_rot"""
+    
+    print(f"📝 Instruction created with {len(class_names)} classes (text-based fallback)")
 
 def convert_to_conversation(sample):
     try:
@@ -135,6 +502,9 @@ def convert_to_conversation(sample):
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
+        # Get the special token for this class
+        special_token = class_to_token[sample["class"]]
+        
         conversation = [
             { "role": "user",
               "content" : [
@@ -143,7 +513,7 @@ def convert_to_conversation(sample):
             },
             { "role" : "assistant",
               "content" : [
-                {"type" : "text",  "text"  : sample["class"]} ]
+                {"type" : "text",  "text"  : special_token} ]
             },
         ]
         return { "messages" : conversation }
@@ -161,13 +531,24 @@ val_converted_dataset = [convert_to_conversation(sample) for sample in val_datas
 val_converted_dataset = [item for item in val_converted_dataset if item is not None]
 print(f"✅ Converted {len(val_converted_dataset)} validation samples to conversation format")
 
+# Additional validation dataset size control for SFT
+max_val_samples_for_sft = 200  # Limit validation samples during SFT training
+# Note: You can adjust this value based on your needs:
+# - Small (50-100): Very fast evaluation, less comprehensive
+# - Medium (200-500): Balanced speed and coverage  
+# - Large (1000+): More comprehensive but slower
+if len(val_converted_dataset) > max_val_samples_for_sft:
+    val_converted_dataset = random.sample(val_converted_dataset, max_val_samples_for_sft)
+    print(f"⚙️ Reduced validation dataset to {len(val_converted_dataset)} samples for SFT efficiency")
+
 # Show sample
 print("\n📋 Sample training conversation:")
 print(train_converted_dataset[0])
 
 print(f"\n📊 Final dataset split:")
 print(f"   Training samples: {len(train_converted_dataset)}")
-print(f"   Validation samples: {len(val_converted_dataset)}")
+print(f"   Validation samples: {len(val_converted_dataset)} (optimized for SFT)")
+print(f"   Validation ratio: {len(val_converted_dataset)/len(train_converted_dataset):.2%}")
 
 #%%
 # Vision Fine-tuning (exactly as in CLAUDE.md)
@@ -177,15 +558,14 @@ print("\n🚀 Starting Vision Fine-tuning...")
 model = FastVisionModel.get_peft_model(
     model,
     finetune_vision_layers = True,
-    finetune_language_layers = False,
+    finetune_language_layers = True,
     finetune_attention_modules = True,
     finetune_mlp_modules = True,
     r = 32,  # LoRA rank
     lora_alpha = 64,
     lora_dropout = 0,  # Changed from 0.1 to 0 for Unsloth compatibility
     bias = "none",
-    # target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj","vision_embed","tok_embeddings"],
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "vision_embed"],
     random_state = 3407,
     use_gradient_checkpointing = "unsloth",
 )
@@ -193,41 +573,63 @@ model = FastVisionModel.get_peft_model(
 # Enable for training
 FastVisionModel.for_training(model)
 
-# Create trainer with validation dataset and evaluation settings
+# Note: Accuracy metrics removed - using special token prediction instead
+
+# Create trainer with validation dataset and evaluation settings  
 trainer = SFTTrainer(
     model = model,
     tokenizer = tokenizer,
     data_collator = UnslothVisionDataCollator(model, tokenizer), # Must use!
     train_dataset = train_converted_dataset,  # Use converted training data
     eval_dataset = val_converted_dataset,     # Use converted validation data
+    # Note: compute_metrics removed - focusing on loss monitoring only
     args = SFTConfig(
-        per_device_train_batch_size = 8,  # Further reduced for stability
-        per_device_eval_batch_size = 2,   # Validation batch size
-        gradient_accumulation_steps = 8,  # Increased to maintain effective batch size
-        warmup_steps = 5,
-        max_steps = 100,  # Very short for testing
+        per_device_train_batch_size = 1,  # Minimal batch size for debugging
+        per_device_eval_batch_size = 2,   # Very small validation batch for safety
+        gradient_accumulation_steps = 4,  # Reduced to avoid memory issues
+        warmup_steps = 2,
+        max_steps = 5,  # Very short for initial testing
         learning_rate = 1e-4,
         fp16 = not is_bf16_supported(),
         bf16 = is_bf16_supported(),
-        logging_steps = 1,
+        logging_steps = 1,               # Log every step for detailed monitoring
+        logging_strategy = "steps",      # Log based on steps
+        logging_first_step = True,       # Log the first step
         optim = "adamw_8bit",
         weight_decay = 0.01,
-        lr_scheduler_type = "cosine",
+        lr_scheduler_type = "linear",
         seed = 3407,
         output_dir = "./plant_vision_outputs",
+        
+        # Enhanced WandB reporting for detailed metrics
         report_to = "wandb",
         run_name = "gemma3n-plant-vision-ft",
-        use_cpu = False,   # Don't use CPU, stay on GPU
-        dataloader_pin_memory = False,  # Disable pin memory to avoid conflicts
-        dataloader_num_workers = 0,    # Disable multiprocessing to avoid issues
+        logging_nan_inf_filter = True,   # Filter out NaN/Inf values from logs
         
-        # Evaluation settings
+        # Enhanced loss and metric logging
+        log_on_each_node = True,         # Log on each GPU node
+        logging_dir = "./plant_vision_outputs/logs",  # Directory for detailed logs
+        
+        dataloader_pin_memory = False,   # Disable pin memory to avoid conflicts
+        dataloader_num_workers = 0,     # Disable multiprocessing to avoid issues
+        
+        # Evaluation settings for detailed monitoring
         eval_strategy = "steps",         # Enable evaluation
-        eval_steps = 25,                 # Evaluate every 25 steps
-        save_strategy = "steps",         # Save every save_steps
-        save_steps = 50,                 # Less frequent saves
-        load_best_model_at_end = True,   # Load best model at end
-        metric_for_best_model = "eval_loss",  # Use eval loss for best model
+        eval_steps = 10,                 # Evaluate more frequently (every 10 steps)
+        eval_delay = 0,                  # Start evaluation immediately
+        
+        # Save and logging settings
+        save_strategy = "steps",         # Save based on steps
+        save_steps = 20,                 # Must be multiple of eval_steps (10)
+        save_total_limit = 3,            # Keep only last 3 checkpoints
+        load_best_model_at_end = True,   # Load best model based on validation loss
+        metric_for_best_model = "eval_loss",  # Use validation loss for best model
+        greater_is_better = False,       # Lower loss is better
+        
+        # Additional logging settings
+        log_level = "info",              # Set log level to info
+        disable_tqdm = False,            # Keep progress bars enabled
+        dataloader_drop_last = False,    # Don't drop last incomplete batch
 
         # You MUST put the below items for vision finetuning (from CLAUDE.md):
         remove_unused_columns = False,
@@ -243,11 +645,27 @@ print("📈 Training started...")
 trainer.train()
 
 print("🎉 Training completed!")
-print(f"💾 Model saved to: ./plnat_vision_outputs")
+print(f"💾 Model saved to: ./plant_vision_outputs")
+
+if special_tokens is not None:
+    print(f"🏷️ Model trained to predict special tokens: {special_tokens[:3]}... (total: {len(special_tokens)})")
+    model_type = "special_token_classification"
+    log_data = {
+        "training_status": "completed",
+        "model_type": model_type,
+        "num_special_tokens": len(special_tokens)
+    }
+else:
+    print(f"📝 Model trained for text-based classification with {len(class_names)} classes")
+    model_type = "text_classification"
+    log_data = {
+        "training_status": "completed", 
+        "model_type": model_type,
+        "num_classes": len(class_names)
+    }
 
 # Log training completion to WandB
-wandb.log({"training_status": "completed"})
-wandb.finish()
+wandb.log(log_data)
 
 #%%
 # Test the model
@@ -262,30 +680,13 @@ if test_image.mode != 'RGB':
 test_messages = [{
     "role": "user",
     "content": [
-        {"type": "text", "text": "What type of plnat is this?"},
+        {"type": "text", "text": instruction},
         {"type": "image", "image": test_image}
     ]
 }]
 
-# Generate response
-inputs = tokenizer.apply_chat_template(
-    test_messages,
-    add_generation_prompt=True,
-    tokenize=True,
-    return_dict=True,
-    return_tensors="pt"
-).to("cuda")
-
-outputs = model.generate(
-    **inputs,
-    max_new_tokens=50,
-    temperature=0.7,
-    do_sample=True,
-    pad_token_id=tokenizer.eos_token_id
-)
-
-response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+# Generate response using safe inference function
+response = do_gemma_3n_inference_safe(test_messages, max_new_tokens=50)
 
 print(f"✅ Test completed!")
 print(f"\n🖼️ Test Image: {os.path.basename(test_sample['path'])}")
@@ -295,28 +696,134 @@ print("=" * 50)
 display(test_image)
 
 print(f"🏷️ Actual class: {test_sample['class']}")
+if special_tokens is not None:
+    print(f"🔗 Expected token: {class_to_token[test_sample['class']]}")
+else:
+    print(f"📝 Expected response: {test_sample['class']}")
 print(f"🤖 Model response: {response}")
 
-# Extract predicted class name from response
-def extract_predicted_class(response_text, available_classes):
-    """Extract the most likely class name from model response"""
-    response_lower = response_text.lower()
+# Utility functions for detailed logging
+def log_prediction_result(step_name: str, actual_label: str, predicted_label: str, 
+                         response_text: str, confidence: float, is_correct: bool,
+                         image=None, step_number: int = None):
+    """Log detailed prediction result to WandB"""
+    log_data = {
+        f"{step_name}/actual_label": actual_label,
+        f"{step_name}/predicted_label": predicted_label or "None",
+        f"{step_name}/response_text": response_text,
+        f"{step_name}/confidence": confidence,
+        f"{step_name}/is_correct": is_correct,
+    }
     
-    # Look for exact matches first
+    if step_number is not None:
+        log_data[f"{step_name}/step_number"] = step_number
+    
+    if image is not None:
+        log_data[f"{step_name}/test_image"] = wandb.Image(image, caption=f"Actual: {actual_label}")
+    
+    wandb.log(log_data)
+
+# Import statement moved above with other imports
+
+def update_class_statistics(class_stats: dict, actual_class: str, predicted_class: str, is_correct: bool):
+    """Update running class-wise statistics"""
+    if actual_class not in class_stats:
+        class_stats[actual_class] = {"total": 0, "correct": 0, "predictions": []}
+    
+    class_stats[actual_class]["total"] += 1
+    if is_correct:
+        class_stats[actual_class]["correct"] += 1
+    class_stats[actual_class]["predictions"].append(predicted_class or "None")
+    
+    return class_stats
+
+# Enhanced prediction extraction for adaptive approach
+def extract_predicted_label(response_text: str, available_classes: list) -> tuple:
+    """Extract predicted class from response (special token or text-based)
+    
+    Args:
+        response_text: Model response text
+        available_classes: List of valid class names
+        
+    Returns:
+        tuple: (predicted_class, confidence_score)
+    """
+    import re
+    from difflib import SequenceMatcher
+    
+    response_clean = response_text.strip()
+    
+    if special_tokens is not None:
+        # Special token approach
+        # Step 1: Look for exact special token pattern
+        token_pattern = r'<PLANT_CLASS_(\d+)>'
+        matches = re.findall(token_pattern, response_clean)
+        
+        if matches:
+            try:
+                # Extract the class index from the first match
+                class_index = int(matches[0])
+                
+                # Check if index is valid
+                if 0 <= class_index < len(class_names):
+                    predicted_class = class_names[class_index]
+                    return predicted_class, 1.0  # High confidence for exact token match
+                else:
+                    print(f"⚠️ Invalid class index {class_index} (max: {len(class_names)-1})")
+            except ValueError:
+                print(f"⚠️ Could not parse class index from token")
+        
+        # Step 2: Look for any special token in the response (more permissive)
+        general_token_pattern = r'<PLANT_CLASS_\d+>'
+        token_matches = re.findall(general_token_pattern, response_clean)
+        
+        for token in token_matches:
+            if token in token_to_class:
+                predicted_class = token_to_class[token]
+                return predicted_class, 0.95  # High confidence for valid token
+    
+    # Step 3: Text-based matching (used for fallback or if no tokens found)
+    # Exact match (highest confidence)
     for class_name in available_classes:
+        if class_name == response_clean:
+            return class_name, 0.9 if special_tokens is None else 0.7
+    
+    # Case-insensitive exact match
+    response_lower = response_clean.lower()
+    for class_name in available_classes:
+        if class_name.lower() == response_lower:
+            return class_name, 0.85 if special_tokens is None else 0.65
+    
+    # Substring match
+    for class_name in available_classes:
+        if class_name in response_clean:
+            return class_name, 0.8 if special_tokens is None else 0.6
         if class_name.lower() in response_lower:
-            return class_name
+            return class_name, 0.75 if special_tokens is None else 0.55
     
-    # If no exact match, look for partial matches
+    # Fuzzy matching for robustness
+    best_match = None
+    best_score = 0.0
+    
     for class_name in available_classes:
-        class_words = class_name.lower().split()
-        if any(word in response_lower for word in class_words if len(word) > 3):
-            return class_name
+        similarity = SequenceMatcher(None, response_lower, class_name.lower()).ratio()
+        if similarity > best_score and similarity > 0.6:
+            best_score = similarity
+            best_match = class_name
     
-    return None
+    if best_match:
+        confidence = best_score * (0.7 if special_tokens is None else 0.5)
+        return best_match, confidence
+    
+    # Step 4: No valid prediction found
+    approach = "special token" if special_tokens is not None else "text-based"
+    print(f"⚠️ No valid {approach} prediction found in response: '{response_clean}'")
+    return available_classes[0] if available_classes else None, 0.1
 
 class_names = train_dataset_folder.classes
-predicted_class = extract_predicted_class(response, class_names)
+predicted_class, confidence = extract_predicted_label(response, class_names)
+
+print(f"🎯 Prediction confidence: {confidence:.2%}")
 
 if predicted_class:
     print(f"🔍 Extracted predicted class: {predicted_class}")
@@ -345,10 +852,25 @@ if predicted_class:
 else:
     print("❓ Could not extract a clear class prediction from the response")
 
-# Check if prediction is correct
-is_correct = test_sample['class'].lower() in response.lower()
-result_emoji = "✅" if is_correct else "❌"
-print(f"{result_emoji} Prediction: {'Correct' if is_correct else 'Incorrect'}")
+# Check if prediction is correct (use exact matching)
+is_correct = (predicted_class == test_sample['class']) if predicted_class else False
+is_partial_match = test_sample['class'].lower() in response.lower()
+
+result_emoji = "✅" if is_correct else ("🟡" if is_partial_match else "❌")
+accuracy_status = "Exact Match" if is_correct else ("Partial Match" if is_partial_match else "Incorrect")
+print(f"{result_emoji} Prediction: {accuracy_status}")
+
+# Log detailed single test result
+log_prediction_result(
+    step_name="single_test",
+    actual_label=test_sample['class'],
+    predicted_label=predicted_class,
+    response_text=response,
+    confidence=confidence,
+    is_correct=is_correct,
+    image=test_image,
+    step_number=1
+)
 
 # Log to WandB
 wandb_log_data = {
@@ -360,6 +882,7 @@ wandb_log_data = {
 
 if predicted_class:
     wandb_log_data["single_test/extracted_class"] = predicted_class
+    wandb_log_data["single_test/prediction_confidence"] = confidence
     
     # Log reference images if available
     if predicted_class_samples:
@@ -373,148 +896,4 @@ if predicted_class:
             )
 
 wandb.log(wandb_log_data)
-
-#%%
-# Multiple test cases from different classes
-print("\n🧪 Testing multiple samples from different classes...")
-print("=" * 60)
-
-# Get unique classes and select one sample from each (from combined dataset)
-combined_dataset = train_dataset + val_dataset
-unique_classes = list(set([item['class'] for item in combined_dataset]))
-test_samples = []
-
-for class_name in unique_classes[:5]:  # Test first 5 classes
-    class_samples = [item for item in combined_dataset if item['class'] == class_name]
-    if class_samples:
-        test_samples.append(random.choice(class_samples))
-
-# Create WandB Table for multiple test results
-table_columns = ["Test Image", "Actual Class", "Predicted Response", "Extracted Class", "Is Correct", "Reference 1", "Reference 2"]
-test_table = wandb.Table(columns=table_columns)
-correct_count = 0
-
-for i, sample in enumerate(test_samples, 1):
-    print(f"\n📸 Test Case {i}/5: {sample['class']}")
-    print("-" * 40)
-    
-    # Load and display image
-    test_img = Image.open(sample["path"])
-    if test_img.mode != 'RGB':
-        test_img = test_img.convert('RGB')
-    
-    display(test_img)
-    
-    # Generate prediction
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "What type of plnat is this?"},
-            {"type": "image", "image": test_img}
-        ]
-    }]
-    
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt"
-    ).to("cuda")
-    
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=50,
-        temperature=0.7,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id
-    )
-    
-    response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-    prediction = tokenizer.decode(response_tokens, skip_special_tokens=True)
-    
-    # Display results
-    print(f"🏷️ Actual: {sample['class']}")
-    print(f"🤖 Predicted: {prediction}")
-    
-    # Extract and show reference images for predicted class
-    predicted_class = extract_predicted_class(prediction, class_names)
-    
-    if predicted_class:
-        print(f"🔍 Extracted class: {predicted_class}")
-        predicted_class_samples = [item for item in combined_dataset if item['class'] == predicted_class]
-        
-        if predicted_class_samples and len(predicted_class_samples) > 0:
-            print(f"📚 Reference examples for '{predicted_class}':")
-            reference_samples = random.sample(predicted_class_samples, min(2, len(predicted_class_samples)))
-            
-            for j, ref_sample in enumerate(reference_samples, 1):
-                ref_image = Image.open(ref_sample["path"])
-                if ref_image.mode != 'RGB':
-                    ref_image = ref_image.convert('RGB')
-                
-                print(f"  Ref {j}: {os.path.basename(ref_sample['path'])}")
-                display(ref_image)
-    
-    is_match = sample['class'].lower() in prediction.lower()
-    status_emoji = "✅" if is_match else "❌"
-    print(f"{status_emoji} {'CORRECT' if is_match else 'INCORRECT'}")
-    
-    if is_match:
-        correct_count += 1
-    
-    # Add row to WandB table
-    table_row = [
-        wandb.Image(test_img, caption=f"Test: {sample['class']}"),
-        sample['class'],
-        prediction,
-        predicted_class if predicted_class else "N/A",
-        is_match
-    ]
-    
-    # Add reference images to table
-    if predicted_class and predicted_class_samples:
-        for k in range(2):  # Add up to 2 reference images
-            if k < len(reference_samples):
-                ref_img = Image.open(reference_samples[k]["path"])
-                if ref_img.mode != 'RGB':
-                    ref_img = ref_img.convert('RGB')
-                table_row.append(wandb.Image(ref_img, caption=f"Ref: {predicted_class}"))
-            else:
-                table_row.append(None)  # Empty cell if no reference image
-    else:
-        table_row.extend([None, None])  # Empty cells for reference images
-    
-    test_table.add_data(*table_row)
-    
-    if i < len(test_samples):
-        print("\n" + "="*60)
-
-# Summary statistics
-accuracy = (correct_count / len(test_samples)) * 100 if test_samples else 0
-
-print(f"\n📊 Test Summary:")
-print("=" * 30)
-print(f"🧬 Classes tested: {len(test_samples)}")
-print(f"🔬 Total available classes: {len(unique_classes)}")
-print(f"🎯 Accuracy: {accuracy:.1f}% ({correct_count}/{len(test_samples)})")
-
-# Log comprehensive results to WandB
-wandb.log({
-    "multiple_tests/test_results_table": test_table,
-    "multiple_tests/accuracy": accuracy,
-    "multiple_tests/correct_predictions": correct_count,
-    "multiple_tests/total_tests": len(test_samples),
-    "multiple_tests/total_classes": len(unique_classes)
-})
-# %%
-import torch
-import gc
-
-# del model
-# del trainer
-torch.cuda.empty_cache()
-torch.cuda.ipc_collect()
-gc.collect()
-
-# %%
+wandb.finish()
