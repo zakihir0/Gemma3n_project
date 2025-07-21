@@ -156,6 +156,51 @@ IMPORTANT:
 
 print(f"📝 Instruction created with {len(class_names)} classes using direct class names")
 
+def conversation_to_example(messages, tokenizer):
+    """
+    入力:
+        messages … conversation 構造
+    出力:
+        dict(input_ids, attention_mask, labels, is_label)  
+        labels  : 正解 token id (label 位置以外は -100)
+        is_label: label 位置だけ 1 の mask  (shape = seq_len)
+    """
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=False,   # Assistant 部分も含めてエンコードする
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+
+    ids  = encoded["input_ids"][0]
+    mask = encoded["attention_mask"][0]
+
+    # --- assistant 部分のオフセットを検出 ------------------
+    # chat_template は role マーカーを含むので
+    #   <assistant>\n  の直後から class_name が来る
+    asst_str = "<assistant>\n"
+    asst_tok = tokenizer.encode(asst_str, add_special_tokens=False)
+    try:
+        start = (ids.tolist()).index(asst_tok[-1]) + 1   # 最後のトークン直後
+    except ValueError:
+        raise RuntimeError("assistant タグが見つかりません")
+
+    # 末尾までをラベルとする（改行 or BOS/EOS で止めても OK）
+    end = len(ids)
+
+    labels      = torch.full_like(ids, -100)
+    is_label    = torch.zeros_like(ids)          # mask 用
+    labels[start:end]   = ids[start:end]
+    is_label[start:end] = 1
+
+    return {
+        "input_ids": ids,
+        "attention_mask": mask,
+        "labels": labels,
+        "is_label": is_label,        # ← 追加
+    }
+
 def convert_to_conversation(sample):
     try:
         # Load image as PIL Image object instead of path string
@@ -184,14 +229,26 @@ def convert_to_conversation(sample):
         return None
 
 #%%
-# Convert train and validation datasets to conversation format separately
-train_converted_dataset = [convert_to_conversation(sample) for sample in train_dataset]
-train_converted_dataset = [item for item in train_converted_dataset if item is not None]
-print(f"✅ Converted {len(train_converted_dataset)} training samples to conversation format")
+# Convert train and validation datasets using conversation_to_example
+def process_dataset_with_labels(dataset, dataset_name):
+    """データセットをconversation_to_exampleを使って適切なラベル付きに変換"""
+    processed_dataset = []
+    for sample in dataset:
+        conv_sample = convert_to_conversation(sample)
+        if conv_sample is not None:
+            try:
+                # conversation_to_exampleで適切なラベルとマスクを生成
+                labeled_example = conversation_to_example(conv_sample["messages"], tokenizer)
+                processed_dataset.append(labeled_example)
+            except Exception as e:
+                print(f"❌ Error processing {dataset_name} sample: {e}")
+    return processed_dataset
 
-val_converted_dataset = [convert_to_conversation(sample) for sample in val_dataset]
-val_converted_dataset = [item for item in val_converted_dataset if item is not None]
-print(f"✅ Converted {len(val_converted_dataset)} validation samples to conversation format")
+train_converted_dataset = process_dataset_with_labels(train_dataset, "training")
+print(f"✅ Converted {len(train_converted_dataset)} training samples with proper labels and masks")
+
+val_converted_dataset = process_dataset_with_labels(val_dataset, "validation")
+print(f"✅ Converted {len(val_converted_dataset)} validation samples with proper labels and masks")
 
 # Additional validation dataset size control for SFT
 max_val_samples_for_sft = 200  # Limit validation samples during SFT training
@@ -237,12 +294,12 @@ FastVisionModel.for_training(model_SFT)
 
 # Note: Using standard SFTTrainer for text-based classification
 
-# Create class token sequences for MultiToken SubsetLossTrainer
+# Create class token sequences for LabelOnlyTrainer
 import torch
 import torch.nn.functional as F
 
 class_token_seqs = []  # list of token sequences for each class
-class_name_to_seq = {}  # mapping from class name to token sequence
+class_name_to_seq = {}  # mapping from class name to token sequence (legacy, not used by LabelOnlyTrainer)
 
 for i, class_name in enumerate(class_names):
     if hasattr(tokenizer, 'tokenizer'):
@@ -262,100 +319,83 @@ for i, class_name in enumerate(class_names):
     else:
         class_token_seqs.append([])
 
-seq_lengths = [len(seq) for seq in class_token_seqs]
+seq_lengths = [len(seq) for seq in class_token_seqs]  # Legacy, not used by LabelOnlyTrainer
 
-class SubsetLossTrainer(SFTTrainer):
-    def __init__(self, class_token_seqs, class_name_to_seq, seq_lengths, *args, **kwargs):
+class ClassCETrainer(SFTTrainer):
+    def __init__(self, class_token_seqs, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.class_token_seqs = class_token_seqs
-        self.class_name_to_seq = class_name_to_seq
-        self.seq_lengths = torch.tensor(seq_lengths, dtype=torch.float)
-        self.num_classes = len(class_token_seqs)
+        self.class_token_seqs = class_token_seqs   # list[list[int]]
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
-        try:
-            labels = inputs["labels"]
-            outputs = model(**{k: v for k,v in inputs.items() if k!="labels"})
-            logits = outputs.logits
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # --- forward ----------------------------------
+        labels = inputs.pop("labels")
         
-            mask = labels.ne(-100)
-            B = labels.size(0)
-            device = labels.device
+        # is_labelが存在しない場合のフォールバック処理
+        if "is_label" in inputs:
+            is_mask = inputs.pop("is_label")
+        else:
+            # フォールバック: labelsから-100以外の部分をマスクとして使用
+            is_mask = (labels != -100).long()
+            print("WARNING: is_label not found, using labels != -100 as mask")
             
-            target_classes = []
-            valid_samples = []
+        outputs = model(**inputs)
+        logits  = outputs.logits           # [B, L, V]
+        logp    = torch.log_softmax(logits, dim=-1)
+
+        B, L, V = logits.shape
+        num_cls = len(self.class_token_seqs)
+
+        print(f"\n=== CLASS CE DEBUG ===")
+        print(f"Batch size: {B}, Seq len: {L}, Vocab size: {V}")
+        print(f"Num classes: {num_cls}")
+
+        # --- token → class へ集約 ----------------------
+        device = logits.device
+        agg_logp = torch.zeros(B, num_cls, device=device) - 1e30   # -∞ 初期化
+        tgt_cls  = torch.full((B,), -1, device=device)             # 正解クラス id
+
+        for b in range(B):
+            # ラベル部分の token id
+            label_idx = torch.where(is_mask[b]==1)[0]
+            target_ids = labels[b, label_idx].tolist()
             
-            for batch_idx in range(B):
-                sample_mask = mask[batch_idx]
-                supervised_indices = torch.where(sample_mask)[0]
-                
-                if len(supervised_indices) == 0:
-                    continue
-                
-                supervised_tokens = labels[batch_idx, supervised_indices].tolist()
-                
-                target_class = None
-                for class_idx, class_seq in enumerate(self.class_token_seqs):
-                    if len(class_seq) <= len(supervised_tokens):
-                        for start_pos in range(len(supervised_tokens) - len(class_seq) + 1):
-                            if supervised_tokens[start_pos:start_pos + len(class_seq)] == class_seq:
-                                target_class = class_idx
-                                break
-                    if target_class is not None:
-                        break
-                
-                if target_class is not None:
-                    target_classes.append(target_class)
-                    valid_samples.append(batch_idx)
-            
-            if not valid_samples:
-                return outputs.loss if hasattr(outputs, 'loss') else torch.tensor(0.0, requires_grad=True)
-            
-            log_softmax_logits = F.log_softmax(logits, dim=-1)
-            log_prob_sum = torch.zeros(len(valid_samples), self.num_classes, device=device)
-            
-            for sample_idx, batch_idx in enumerate(valid_samples):
-                sample_mask = mask[batch_idx]
-                supervised_indices = torch.where(sample_mask)[0]
-                
-                for class_idx, token_seq in enumerate(self.class_token_seqs):
-                    if len(token_seq) == 0:
-                        continue
-                        
-                    class_log_prob = 0.0
-                    seq_found = False
-                    
-                    supervised_tokens = labels[batch_idx, supervised_indices].tolist()
-                    for start_pos in range(len(supervised_tokens) - len(token_seq) + 1):
-                        if supervised_tokens[start_pos:start_pos + len(token_seq)] == token_seq:
-                            for token_idx, token_id in enumerate(token_seq):
-                                pos_in_sequence = supervised_indices[start_pos + token_idx]
-                                class_log_prob += log_softmax_logits[batch_idx, pos_in_sequence, token_id]
-                            seq_found = True
-                            break
-                    
-                    if seq_found:
-                        log_prob_sum[sample_idx, class_idx] = class_log_prob
-                    else:
-                        log_prob_sum[sample_idx, class_idx] = -100.0
-            
-                seq_lengths_tensor = self.seq_lengths.to(device)
-                normalized_scores = log_prob_sum / seq_lengths_tensor.unsqueeze(0)
-                
-                target_tensor = torch.tensor(target_classes, device=device)
-                loss = F.cross_entropy(normalized_scores, target_tensor)
-                
-                return (loss, outputs) if return_outputs else loss
-        except Exception as e:
-            print(f"Error in compute_loss: {e}")
-            # Fallback to default loss
-            return outputs.loss if hasattr(outputs, 'loss') else torch.tensor(0.0, requires_grad=True, device=inputs["labels"].device)
+            if b < 2:  # Debug first 2 samples
+                print(f"Sample {b}: Label indices: {label_idx.shape}, target_ids: {target_ids[:10]}...")
+
+            # 正解クラスを同定
+            for cid, seq in enumerate(self.class_token_seqs):
+                if target_ids == seq:
+                    tgt_cls[b] = cid
+                    if b < 2:
+                        print(f"Sample {b}: EXACT MATCH with class {cid}")
+                #   ---- log P(seq) = Σ log P(token_t | x) ----
+                if len(seq)==len(label_idx):
+                    tok_logp = logp[b, label_idx, torch.tensor(seq, device=device)]
+                    agg_logp[b, cid] = tok_logp.sum()
+                elif b < 2 and cid < 3:  # Debug first 3 classes
+                    print(f"Sample {b}: Class {cid} length mismatch ({len(seq)} vs {len(label_idx)})")
+
+        # masking (未該当サンプルは除く)
+        valid = tgt_cls.ne(-1)
+        agg_logp_valid  = agg_logp[valid]
+        tgt_cls_valid   = tgt_cls[valid]
+        
+        print(f"Valid samples: {valid.sum().item()}/{B}")
+        if valid.sum() > 0:
+            print(f"Target classes: {tgt_cls_valid.tolist()}")
+            loss = torch.nn.functional.cross_entropy(agg_logp_valid, tgt_cls_valid)
+            print(f"Loss: {loss.item():.6f}")
+        else:
+            print("No valid samples found!")
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        print("=== END DEBUG ===\n")
+
+        return (loss, outputs) if return_outputs else loss
 
 # Create trainer with validation dataset and evaluation settings  
-trainer = SubsetLossTrainer(
+trainer = ClassCETrainer(
     class_token_seqs=class_token_seqs,
-    class_name_to_seq=class_name_to_seq,
-    seq_lengths=seq_lengths,
     model = model_SFT,
     tokenizer = tokenizer,
     data_collator = UnslothVisionDataCollator(model_SFT, tokenizer), # Must use!
