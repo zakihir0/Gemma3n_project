@@ -53,10 +53,10 @@ wandb.init(
         "lora_rank": 32,
         "lora_alpha": 64,
         "learning_rate": 1e-4,
-        "max_steps": 100,
-        "eval_steps": 10,
+        "max_steps": 300,
+        "eval_steps": 30,
         "per_device_train_batch_size": 8,
-        "per_device_eval_batch_size": 16,
+        "per_device_eval_batch_size": 8,
         "gradient_accumulation_steps": 8,
     }
 )
@@ -139,135 +139,53 @@ print(f"Validation samples: {len(val_dataset)}")
 print(f"Train class distribution: {train_counts}")
 print(f"Val class distribution: {val_counts}")
 
-#%%
-# Convert to conversation format using class names directly
-class_list_str = "\n".join([f"- {cls}" for cls in class_names])
-
-instruction = f"""You are an expert plant disease classifier. 
-Analyze the image and respond with ONLY the exact class name from this list:
-
-{class_list_str}
-
-IMPORTANT: 
-- Return exactly one class name from the list above
-- Use the exact format shown (including underscores if present)
-- Do not add any explanation or additional text
-- Example response: Apple___Black_rot"""
-
-print(f"📝 Instruction created with {len(class_names)} classes using direct class names")
-
-def conversation_to_example(messages, tokenizer):
-    """
-    入力:
-        messages … conversation 構造
-    出力:
-        dict(input_ids, attention_mask, labels, is_label)  
-        labels  : 正解 token id (label 位置以外は -100)
-        is_label: label 位置だけ 1 の mask  (shape = seq_len)
-    """
-    encoded = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=False,   # Assistant 部分も含めてエンコードする
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
-
-    ids  = encoded["input_ids"][0]
-    mask = encoded["attention_mask"][0]
-
-    # --- assistant 部分のオフセットを検出 ------------------
-    # chat_template は role マーカーを含むので
-    #   <assistant>\n  の直後から class_name が来る
-    asst_str = "<assistant>\n"
-    asst_tok = tokenizer.encode(asst_str, add_special_tokens=False)
-    try:
-        start = (ids.tolist()).index(asst_tok[-1]) + 1   # 最後のトークン直後
-    except ValueError:
-        raise RuntimeError("assistant タグが見つかりません")
-
-    # 末尾までをラベルとする（改行 or BOS/EOS で止めても OK）
-    end = len(ids)
-
-    labels      = torch.full_like(ids, -100)
-    is_label    = torch.zeros_like(ids)          # mask 用
-    labels[start:end]   = ids[start:end]
-    is_label[start:end] = 1
-
-    return {
-        "input_ids": ids,
-        "attention_mask": mask,
-        "labels": labels,
-        "is_label": is_label,        # ← 追加
-    }
-
-def convert_to_conversation(sample):
-    try:
-        # Load image as PIL Image object instead of path string
-        image = Image.open(sample["path"])
-        # Convert to RGB if needed (handles RGBA, grayscale, etc.)
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Use the class name directly as target
-        class_name = sample["class"]
-        
-        conversation = [
-            { "role": "user",
-              "content" : [
-                {"type" : "text",  "text"  : instruction},
-                {"type" : "image", "image" : image} ]
-            },
-            { "role" : "assistant",
-              "content" : [
-                {"type" : "text",  "text"  : class_name} ]
-            },
-        ]
-        return { "messages" : conversation }
-    except Exception as e:
-        print(f"❌ Error loading image {sample['path']}: {e}")
-        return None
+# テキスト指示は不要 - Vision分類では画像のみを使用
 
 #%%
-# Convert train and validation datasets using conversation_to_example
-def process_dataset_with_labels(dataset, dataset_name):
-    """データセットをconversation_to_exampleを使って適切なラベル付きに変換"""
+# Vision分類用のデータセット処理
+def process_vision_dataset(dataset, dataset_name, class_names):
+    """Vision分類用にデータセットを処理（画像とクラスIDのペア）"""
     processed_dataset = []
+    normal_mapping = {cls: idx for idx, cls in enumerate(class_names)}
+    
     for sample in dataset:
-        conv_sample = convert_to_conversation(sample)
-        if conv_sample is not None:
-            try:
-                # conversation_to_exampleで適切なラベルとマスクを生成
-                labeled_example = conversation_to_example(conv_sample["messages"], tokenizer)
-                processed_dataset.append(labeled_example)
-            except Exception as e:
-                print(f"❌ Error processing {dataset_name} sample: {e}")
+        try:
+            # 画像を読み込み
+            image = Image.open(sample["path"])
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # クラス名をIDに変換
+            class_id = normal_mapping[sample["class"]]
+            
+            processed_dataset.append({
+                "image": image,
+                "labels": class_id  # クラスID (int)
+            })
+            
+        except Exception as e:
+            print(f"❌ Error processing {dataset_name} sample {sample['path']}: {e}")
+    
     return processed_dataset
 
-train_converted_dataset = process_dataset_with_labels(train_dataset, "training")
-print(f"✅ Converted {len(train_converted_dataset)} training samples with proper labels and masks")
+# Vision分類用データセット作成
+train_vision_dataset = process_vision_dataset(train_dataset, "training", class_names)
+print(f"✅ Converted {len(train_vision_dataset)} training samples for vision classification")
 
-val_converted_dataset = process_dataset_with_labels(val_dataset, "validation")
-print(f"✅ Converted {len(val_converted_dataset)} validation samples with proper labels and masks")
+val_vision_dataset = process_vision_dataset(val_dataset, "validation", class_names)
+print(f"✅ Converted {len(val_vision_dataset)} validation samples for vision classification")
 
-# Additional validation dataset size control for SFT
-max_val_samples_for_sft = 200  # Limit validation samples during SFT training
-# Note: You can adjust this value based on your needs:
-# - Small (50-100): Very fast evaluation, less comprehensive
-# - Medium (200-500): Balanced speed and coverage  
-# - Large (1000+): More comprehensive but slower
-if len(val_converted_dataset) > max_val_samples_for_sft:
-    val_converted_dataset = random.sample(val_converted_dataset, max_val_samples_for_sft)
-    print(f"⚙️ Reduced validation dataset to {len(val_converted_dataset)} samples for SFT efficiency")
+# 従来のconversation形式の処理は削除 - Vision分類のみを使用
 
-# Show sample
-print("\n📋 Sample training conversation:")
-print(train_converted_dataset[0])
+# Show sample from vision dataset
+print("\n📋 Sample vision dataset entry:")
+print(f"Image path: {train_vision_dataset[0]['image']}")
+print(f"Label: {train_vision_dataset[0]['labels']} (class: {class_names[train_vision_dataset[0]['labels']]})")
 
 print(f"\n📊 Final dataset split:")
-print(f"   Training samples: {len(train_converted_dataset)}")
-print(f"   Validation samples: {len(val_converted_dataset)} (optimized for SFT)")
-print(f"   Validation ratio: {len(val_converted_dataset)/len(train_converted_dataset):.2%}")
+print(f"   Training samples: {len(train_vision_dataset)}")
+print(f"   Validation samples: {len(val_vision_dataset)}")
+print(f"   Validation ratio: {len(val_vision_dataset)/len(train_vision_dataset):.2%}")
 
 #%%
 # Vision Fine-tuning (exactly as in CLAUDE.md)
@@ -294,184 +212,286 @@ FastVisionModel.for_training(model_SFT)
 
 # Note: Using standard SFTTrainer for text-based classification
 
-# Create class token sequences for LabelOnlyTrainer
 import torch
 import torch.nn.functional as F
 
-class_token_seqs = []  # list of token sequences for each class
-class_name_to_seq = {}  # mapping from class name to token sequence (legacy, not used by LabelOnlyTrainer)
+import torch.nn as nn
+from transformers import Trainer
+from torch.utils.data import DataLoader
+from transformers.modeling_outputs import SequenceClassifierOutput
+import numpy as np
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
-for i, class_name in enumerate(class_names):
-    if hasattr(tokenizer, 'tokenizer'):
-        actual_tokenizer = tokenizer.tokenizer
-        tokens = actual_tokenizer.encode(class_name, add_special_tokens=False)
-    elif hasattr(tokenizer, 'encode_text'):
-        tokens = tokenizer.encode_text(class_name, add_special_tokens=False)
-    elif hasattr(tokenizer, '__call__'):
-        result = tokenizer(class_name, add_special_tokens=False, return_tensors="pt")
-        tokens = result['input_ids'][0].tolist() if 'input_ids' in result else []
-    else:
-        tokens = []
+class VisionClassifier(nn.Module):
+    """Vision Tower + Linear分類器"""
+    def __init__(self, vision_model, num_classes, hidden_dim, pooling='mean'):
+        super().__init__()
+        self.vision_model = vision_model
+        self.pooling = pooling
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+        self.dropout = nn.Dropout(0.1)
+        
+        # Attention pooling用
+        if pooling == 'attention':
+            self.attention = nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True)
+            self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
     
-    if tokens:
-        class_token_seqs.append(tokens)
-        class_name_to_seq[class_name] = tokens
-    else:
-        class_token_seqs.append([])
+    def pool_features(self, features):
+        """特徴量をプーリングして1ベクトルに集約"""
+        # featuresの形状を確認してから処理
+        if len(features.shape) == 2:
+            # Already pooled features (B, hidden_dim)
+            return features
+        elif len(features.shape) == 3:
+            # features: (B, seq_len, hidden_dim) - Transformer形式
+            B, seq_len, hidden_dim = features.shape
+            
+            if self.pooling == 'mean':
+                return features.mean(dim=1)  # (B, hidden_dim)
+            
+            elif self.pooling == 'cls':
+                # 最初のトークンを使用
+                return features[:, 0, :]  # (B, hidden_dim)
+            
+            elif self.pooling == 'attention':
+                # CLSトークンを使ったattention pooling
+                cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, hidden_dim)
+                pooled, _ = self.attention(cls_tokens, features, features)
+                return pooled.squeeze(1)  # (B, hidden_dim)
+            
+            else:
+                raise ValueError(f"Unknown pooling method: {self.pooling}")
+        elif len(features.shape) == 4:
+            # features: (B, channels, height, width) - CNN形式
+            B, C, H, W = features.shape
+            
+            if self.pooling == 'mean':
+                # Global Average Pooling
+                return features.mean(dim=[2, 3])  # (B, C)
+            
+            elif self.pooling == 'cls':
+                # Use center feature as "cls"
+                center_h, center_w = H // 2, W // 2
+                return features[:, :, center_h, center_w]  # (B, C)
+            
+            elif self.pooling == 'attention':
+                # Flatten spatial dimensions and apply attention
+                features_flat = features.view(B, C, H * W).transpose(1, 2)  # (B, H*W, C)
+                cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, C)
+                pooled, _ = self.attention(cls_tokens, features_flat, features_flat)
+                return pooled.squeeze(1)  # (B, C)
+            
+            else:
+                raise ValueError(f"Unknown pooling method: {self.pooling}")
+        else:
+            raise ValueError(f"Unexpected feature shape: {features.shape}")
+    
+    def forward(self, pixel_values, labels=None):
+        # Vision Towerから特徴量抽出
+        # TimmWrapperModelの場合は直接forwardを呼ぶ
+        vision_output = self.vision_model(pixel_values)
+        # TimmWrapperModelOutputから実際の特徴量を取得
+        vision_features = vision_output.last_hidden_state
+        
+        
+        # プーリングで1ベクトルに集約
+        pooled_features = self.pool_features(vision_features)
+        pooled_features = self.dropout(pooled_features)
+        
+        # 分類
+        logits = self.classifier(pooled_features)  # (B, num_classes)
+        
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits, labels)
+            
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=None,
+            attentions=None
+        )
 
-seq_lengths = [len(seq) for seq in class_token_seqs]  # Legacy, not used by LabelOnlyTrainer
+def compute_vision_metrics(eval_pred):
+    """Vision分類用の評価メトリクス"""
+    predictions, labels = eval_pred
+    
+    # predictions は logits の形 (batch_size, num_classes)
+    pred_ids = np.argmax(predictions, axis=1)
+    
+    # 基本的なメトリクス
+    accuracy = accuracy_score(labels, pred_ids)
+    
+    # Top-3 accuracy
+    top3_preds = np.argsort(predictions, axis=1)[:, -3:]
+    top3_accuracy = np.mean([label in top3_preds[i] for i, label in enumerate(labels)])
+    
+    # クラス別精度 (各クラスのrecall)
+    cm = confusion_matrix(labels, pred_ids)
+    class_accuracies = cm.diagonal() / cm.sum(axis=1)
+    class_accuracies = np.nan_to_num(class_accuracies)  # 0で割った場合のNaNを0に変換
+    
+    metrics = {
+        'accuracy': accuracy,
+        'top3_accuracy': top3_accuracy,
+        'mean_class_accuracy': np.mean(class_accuracies),
+        'min_class_accuracy': np.min(class_accuracies),
+        'max_class_accuracy': np.max(class_accuracies),
+        'median_class_accuracy': np.median(class_accuracies),
+        'std_class_accuracy': np.std(class_accuracies),
+    }
+    
+    # 全クラスの精度を追加
+    for i, acc in enumerate(class_accuracies):
+        metrics[f'class_{i}_accuracy'] = acc
+    
+    return metrics
 
-class ClassCETrainer(SFTTrainer):
-    def __init__(self, class_token_seqs, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.class_token_seqs = class_token_seqs   # list[list[int]]
-
+class VisionClassificationTrainer(Trainer):
+    """Vision分類用のTrainer"""
+    
+    def __init__(self, model, class_names, *args, **kwargs):
+        super().__init__(model=model, *args, **kwargs)
+        self.class_names = class_names
+        self.num_classes = len(class_names)
+    
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # --- forward ----------------------------------
-        labels = inputs.pop("labels")
+        # pixel_valuesとlabelsを取得
+        pixel_values = inputs.get('pixel_values')
+        labels = inputs.get('labels')  # クラスIDの形式 (B,)
         
-        # is_labelが存在しない場合のフォールバック処理
-        if "is_label" in inputs:
-            is_mask = inputs.pop("is_label")
-        else:
-            # フォールバック: labelsから-100以外の部分をマスクとして使用
-            is_mask = (labels != -100).long()
-            print("WARNING: is_label not found, using labels != -100 as mask")
-            
-        outputs = model(**inputs)
-        logits  = outputs.logits           # [B, L, V]
-        logp    = torch.log_softmax(logits, dim=-1)
-
-        B, L, V = logits.shape
-        num_cls = len(self.class_token_seqs)
-
-        print(f"\n=== CLASS CE DEBUG ===")
-        print(f"Batch size: {B}, Seq len: {L}, Vocab size: {V}")
-        print(f"Num classes: {num_cls}")
-
-        # --- token → class へ集約 ----------------------
-        device = logits.device
-        agg_logp = torch.zeros(B, num_cls, device=device) - 1e30   # -∞ 初期化
-        tgt_cls  = torch.full((B,), -1, device=device)             # 正解クラス id
-
-        for b in range(B):
-            # ラベル部分の token id
-            label_idx = torch.where(is_mask[b]==1)[0]
-            target_ids = labels[b, label_idx].tolist()
-            
-            if b < 2:  # Debug first 2 samples
-                print(f"Sample {b}: Label indices: {label_idx.shape}, target_ids: {target_ids[:10]}...")
-
-            # 正解クラスを同定
-            for cid, seq in enumerate(self.class_token_seqs):
-                if target_ids == seq:
-                    tgt_cls[b] = cid
-                    if b < 2:
-                        print(f"Sample {b}: EXACT MATCH with class {cid}")
-                #   ---- log P(seq) = Σ log P(token_t | x) ----
-                if len(seq)==len(label_idx):
-                    tok_logp = logp[b, label_idx, torch.tensor(seq, device=device)]
-                    agg_logp[b, cid] = tok_logp.sum()
-                elif b < 2 and cid < 3:  # Debug first 3 classes
-                    print(f"Sample {b}: Class {cid} length mismatch ({len(seq)} vs {len(label_idx)})")
-
-        # masking (未該当サンプルは除く)
-        valid = tgt_cls.ne(-1)
-        agg_logp_valid  = agg_logp[valid]
-        tgt_cls_valid   = tgt_cls[valid]
+        # モデルの前向き計算
+        outputs = model(pixel_values=pixel_values, labels=labels)
+        loss = outputs.loss
         
-        print(f"Valid samples: {valid.sum().item()}/{B}")
-        if valid.sum() > 0:
-            print(f"Target classes: {tgt_cls_valid.tolist()}")
-            loss = torch.nn.functional.cross_entropy(agg_logp_valid, tgt_cls_valid)
-            print(f"Loss: {loss.item():.6f}")
-        else:
-            print("No valid samples found!")
-            loss = torch.tensor(0.0, device=device, requires_grad=True)
         
-        print("=== END DEBUG ===\n")
-
         return (loss, outputs) if return_outputs else loss
 
-# Create trainer with validation dataset and evaluation settings  
-trainer = ClassCETrainer(
-    class_token_seqs=class_token_seqs,
-    model = model_SFT,
-    tokenizer = tokenizer,
-    data_collator = UnslothVisionDataCollator(model_SFT, tokenizer), # Must use!
-    train_dataset = train_converted_dataset,  # Use converted training data
-    eval_dataset = val_converted_dataset,     # Use converted validation data
-    # Note: compute_metrics removed - focusing on loss monitoring only
-    args = SFTConfig(
-        per_device_train_batch_size = 8,   # Stable batch size to avoid auto-adjustment
-        per_device_eval_batch_size = 4,   # Conservative validation batch size
-        gradient_accumulation_steps = 8,  # Maintain effective batch size of 64
-        warmup_steps = 10,
-        max_steps = 100,  # More steps for meaningful training
-        learning_rate = 1e-4,
-        fp16 = not is_bf16_supported(),
-        bf16 = is_bf16_supported(),
-        logging_steps = 1,               # Log every step for detailed monitoring
-        logging_strategy = "steps",      # Log based on steps
-        logging_first_step = True,       # Log the first step
-        optim = "adamw_8bit",
-        weight_decay = 0.01,
-        lr_scheduler_type = "linear",
-        seed = 3407,
-        output_dir = "./plant_vision_outputs",
-        
-        # Enhanced WandB reporting for detailed metrics
-        report_to = "wandb",
-        run_name = "gemma3n-plant-vision-ft",
-        logging_nan_inf_filter = True,   # Filter out NaN/Inf values from logs
-        
-        # Enhanced loss and metric logging
-        log_on_each_node = True,         # Log on each GPU node
-        logging_dir = "./plant_vision_outputs/logs",  # Directory for detailed logs
-        
-        dataloader_pin_memory = False,   # Disable pin memory to avoid conflicts
-        dataloader_num_workers = 0,     # Disable multiprocessing to avoid issues
-        
-        # Evaluation settings for detailed monitoring
-        eval_strategy = "steps",         # Enable evaluation
-        eval_steps = 25,                 # Evaluate more frequently (every 10 steps)
-        eval_delay = 0,                  # Start evaluation immediately
-        
-        # Save and logging settings
-        save_strategy = "steps",         # Save based on steps
-        save_steps = 25,                 # Must be multiple of eval_steps (10)
-        save_total_limit = 3,            # Keep only last 3 checkpoints
-        load_best_model_at_end = True,   # Load best model based on validation loss
-        metric_for_best_model = "eval_loss",  # Use validation loss for best model
-        greater_is_better = False,       # Lower loss is better
-        
-        # Additional logging settings
-        log_level = "info",              # Set log level to info
-        disable_tqdm = False,            # Keep progress bars enabled
-        dataloader_drop_last = False,    # Don't drop last incomplete batch
+# ClassCETrainer削除 - Vision分類のみを使用
 
-        # You MUST put the below items for vision finetuning (from CLAUDE.md):
-        remove_unused_columns = False,
-        dataset_text_field = "",
-        dataset_kwargs = {"skip_prepare_dataset": True},
-        dataset_num_proc = 1,
-        max_seq_length = 2048,
+# Vision分類用のデータコレーター
+class VisionDataCollator:
+    def __init__(self, processor):
+        self.processor = processor
+    
+    def __call__(self, batch):
+        # 画像とラベルを分離
+        images = [item["image"] for item in batch]
+        labels = torch.tensor([item["labels"] for item in batch], dtype=torch.long)
+        
+        # 画像を処理
+        # Gemma3nProcessorを使用して画像をpixel_valuesに変換
+        pixel_values = []
+        for image in images:
+            # ダミーのテキストと組み合わせて処理
+            processed = self.processor(
+                text="dummy",  # ダミーテキスト
+                images=image,
+                return_tensors="pt"
+            )
+            pixel_values.append(processed["pixel_values"].squeeze(0))
+        
+        pixel_values = torch.stack(pixel_values)
+        
+        return {
+            "pixel_values": pixel_values,
+            "labels": labels
+        }
+
+# Vision Towerを取得してVisionClassifierを作成
+print("🔍 Extracting Vision Tower from model...")
+
+# PeftModelの階層を辿ってvision_towerを取得
+base_model = model_SFT.base_model.model.model  # Gemma3nForConditionalGeneration
+# base_model is already Gemma3nModel, so access vision_tower directly
+vision_tower = base_model.vision_tower
+
+# Hidden dimensionを取得
+hidden_dim = vision_tower.config.hidden_size if hasattr(vision_tower, 'config') else 3584  # Gemma3nのデフォルト
+
+print(f"Vision Tower: {type(vision_tower)}")
+print(f"Hidden dimension: {hidden_dim}")
+print(f"Number of classes: {len(class_names)}")
+
+# VisionClassifierを作成
+vision_classifier = VisionClassifier(
+    vision_model=vision_tower,
+    num_classes=len(class_names),
+    hidden_dim=hidden_dim,
+    pooling='mean'  # mean, cls, attention から選択
+)
+
+# Vision分類用のトレーナーを作成
+vision_trainer = VisionClassificationTrainer(
+    model=vision_classifier,
+    class_names=class_names,
+    tokenizer=tokenizer,
+    data_collator=VisionDataCollator(tokenizer),
+    train_dataset=train_vision_dataset,
+    eval_dataset=val_vision_dataset,
+    compute_metrics=compute_vision_metrics,
+    args=SFTConfig(
+        per_device_train_batch_size=16,  
+        per_device_eval_batch_size=16,
+        gradient_accumulation_steps=8,  
+        warmup_steps=5,
+        max_steps=300,  # より長い学習で性能向上
+        learning_rate=1e-3,  # Vision分類では少し高めのLR
+        fp16=not is_bf16_supported(),
+        bf16=is_bf16_supported(),
+        logging_steps=5,
+        logging_strategy="steps",
+        logging_first_step=True,
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407,
+        output_dir="./vision_classification_outputs",
+        
+        report_to="wandb",
+        run_name="gemma3n-vision-classification",
+        
+        eval_strategy="steps",
+        eval_steps=50,  # 30ステップごとに評価（より多くのステップに対応）
+        eval_delay=20,  # 最初の20ステップ後から評価開始
+        
+        save_strategy="steps",
+        save_steps=50,  # eval_stepsと同じ値に設定
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_accuracy",
+        greater_is_better=True,
+        
+        dataloader_pin_memory=False,
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
     ),
 )
 
-# Start training
-print("📈 Training started...")
-trainer.train()
+print("🚀 Vision Classification Trainer created!")
+print(f"📊 Training samples: {len(train_vision_dataset)}")
+print(f"📊 Validation samples: {len(val_vision_dataset)}")
 
-print("🎉 Training completed!")
-print(f"💾 Model saved to: ./plant_vision_outputs")
+# Start Vision Classification Training
+print("📈 Vision Classification Training started...")
+print("🎯 Using Vision Tower + Linear Classifier approach")
+print(f"🔧 Pooling method: {vision_classifier.pooling}")
 
-print(f"📝 Model trained with standard SFTTrainer for {len(class_names)} classes")
-model_type = "standard_sft_text_classification"
+# Vision分類でトレーニング
+vision_trainer.train()
+
+print("🎉 Vision Classification Training completed!")
+print(f"💾 Model saved to: ./vision_classification_outputs")
+
+print(f"📝 Model trained with Vision Classification for {len(class_names)} classes")
+model_type = "vision_tower_classification"
 log_data = {
     "training_status": "completed", 
     "model_type": model_type,
-    "num_classes": len(class_names)
+    "num_classes": len(class_names),
+    "pooling_method": vision_classifier.pooling,
+    "hidden_dim": hidden_dim
 }
 
 # Log training completion to WandB
@@ -481,50 +501,41 @@ wandb.log(log_data)
 # Test the model
 print("\n🧪 Testing model...")
 
-# Get a test sample and load as PIL Image (use validation dataset)
-test_sample = val_dataset[0]
-test_image = Image.open(test_sample["path"])
-if test_image.mode != 'RGB':
-    test_image = test_image.convert('RGB')
+# Test the vision classifier
+test_sample = val_vision_dataset[0]
+test_image = test_sample["image"]
+test_label = test_sample["labels"]
+actual_class = class_names[test_label]
 
-test_messages = [{
-    "role": "user",
-    "content": [
-        {"type": "text", "text": instruction},
-        {"type": "image", "image": test_image}
-    ]
-}]
+print(f"Testing on: {actual_class} (label: {test_label})")
 
-# Generate response
-inputs = tokenizer.apply_chat_template(
-    test_messages,
-    add_generation_prompt=True,
-    tokenize=True,
-    return_dict=True,
-    return_tensors="pt"
-).to("cuda")
+# Prepare input for vision classifier
+with torch.no_grad():
+    # Process image using data collator
+    batch = vision_trainer.data_collator([test_sample])
+    pixel_values = batch["pixel_values"].to("cuda")
+    
+    # Get prediction
+    outputs = vision_classifier(pixel_values=pixel_values)
+    logits = outputs.logits
+    predicted_class_id = torch.argmax(logits, dim=-1).item()
+    predicted_class = class_names[predicted_class_id]
+    
+    # Get confidence scores
+    probabilities = torch.softmax(logits, dim=-1)
+    confidence = probabilities[0, predicted_class_id].item()
+    
+    print(f"Predicted: {predicted_class} (confidence: {confidence:.3f})")
 
-outputs = model_SFT.generate(
-    **inputs,
-    max_new_tokens=50,
-    temperature=0.7,
-    do_sample=True,
-    pad_token_id=tokenizer.eos_token_id
-)
-
-response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-response = tokenizer.decode(response_tokens, skip_special_tokens=True)
-
-print(f"✅ Test completed!")
-print(f"\n🖼️ Test Image: {os.path.basename(test_sample['path'])}")
+print(f"✅ Vision classification test completed!")
 print("=" * 50)
 
 # Display the test image
 display(test_image)
 
-print(f"🏷️ Actual class: {test_sample['class']}")
-print(f"📝 Expected response: {test_sample['class']}")
-print(f"🤖 Model response: {response}")
+print(f"🏷️ Actual class: {actual_class}")
+print(f"🔍 Predicted class: {predicted_class}")
+print(f"🎯 Confidence: {confidence:.1%}")
 
 # Utility functions for detailed logging
 def log_prediction_result(step_name: str, actual_label: str, predicted_label: str, 
@@ -612,41 +623,33 @@ def extract_predicted_label(response_text: str, available_classes: list) -> tupl
     print(f"⚠️ No valid text-based prediction found in response: '{response_clean}'")
     return available_classes[0] if available_classes else None, 0.1
 
-class_names = train_dataset_folder.classes
-predicted_class, confidence = extract_predicted_label(response, class_names)
+# Already have predicted_class and confidence from vision classifier
 
-print(f"🎯 Prediction confidence: {confidence:.2%}")
+# Find examples of the predicted class from original dataset
+combined_dataset = train_dataset + val_dataset
+predicted_class_samples = [item for item in combined_dataset if item['class'] == predicted_class]
 
-if predicted_class:
-    print(f"🔍 Extracted predicted class: {predicted_class}")
+if predicted_class_samples:
+    print(f"\n📚 Reference images for '{predicted_class}' (showing 3 examples):")
+    print("-" * 50)
     
-    # Find examples of the predicted class (from combined dataset)
-    combined_dataset = train_dataset + val_dataset
-    predicted_class_samples = [item for item in combined_dataset if item['class'] == predicted_class]
+    # Show up to 3 reference images
+    reference_samples = random.sample(predicted_class_samples, min(3, len(predicted_class_samples)))
     
-    if predicted_class_samples:
-        print(f"\n📚 Reference images for '{predicted_class}' (showing 3 examples):")
-        print("-" * 50)
+    for i, ref_sample in enumerate(reference_samples, 1):
+        ref_image = Image.open(ref_sample["path"])
+        if ref_image.mode != 'RGB':
+            ref_image = ref_image.convert('RGB')
         
-        # Show up to 3 reference images
-        reference_samples = random.sample(predicted_class_samples, min(3, len(predicted_class_samples)))
-        
-        for i, ref_sample in enumerate(reference_samples, 1):
-            ref_image = Image.open(ref_sample["path"])
-            if ref_image.mode != 'RGB':
-                ref_image = ref_image.convert('RGB')
-            
-            print(f"Reference {i}: {os.path.basename(ref_sample['path'])}")
-            display(ref_image)
-            print()
-    else:
-        print(f"❌ No reference images found for '{predicted_class}'")
+        print(f"Reference {i}: {os.path.basename(ref_sample['path'])}")
+        display(ref_image)
+        print()
 else:
-    print("❓ Could not extract a clear class prediction from the response")
+    print(f"❌ No reference images found for '{predicted_class}'")
 
-# Check if prediction is correct (use exact matching)
-is_correct = (predicted_class == test_sample['class']) if predicted_class else False
-is_partial_match = test_sample['class'].lower() in response.lower()
+# Check if prediction is correct
+is_correct = (predicted_class == actual_class)
+is_partial_match = False  # Not applicable for direct classification
 
 result_emoji = "✅" if is_correct else ("🟡" if is_partial_match else "❌")
 accuracy_status = "Exact Match" if is_correct else ("Partial Match" if is_partial_match else "Incorrect")
@@ -655,9 +658,9 @@ print(f"{result_emoji} Prediction: {accuracy_status}")
 # Log detailed single test result
 log_prediction_result(
     step_name="single_test",
-    actual_label=test_sample['class'],
+    actual_label=actual_class,
     predicted_label=predicted_class,
-    response_text=response,
+    response_text=f"Vision classification: {predicted_class}",
     confidence=confidence,
     is_correct=is_correct,
     image=test_image,
@@ -666,27 +669,32 @@ log_prediction_result(
 
 # Log to WandB
 wandb_log_data = {
-    "single_test/test_image": wandb.Image(test_image, caption=f"Test: {test_sample['class']}"),
-    "single_test/actual_class": test_sample['class'],
-    "single_test/predicted_response": response,
+    "single_test/test_image": wandb.Image(test_image, caption=f"Test: {actual_class}"),
+    "single_test/actual_class": actual_class,
+    "single_test/predicted_class": predicted_class,
+    "single_test/confidence": confidence,
     "single_test/is_correct": is_correct
 }
 
-if predicted_class:
-    wandb_log_data["single_test/extracted_class"] = predicted_class
-    wandb_log_data["single_test/prediction_confidence"] = confidence
-    
-    # Log reference images if available
-    if predicted_class_samples:
-        for j, ref_sample in enumerate(reference_samples[:2], 1):  # Log first 2 reference images
-            ref_img = Image.open(ref_sample["path"])
-            if ref_img.mode != 'RGB':
-                ref_img = ref_img.convert('RGB')
-            wandb_log_data[f"single_test/reference_{j}"] = wandb.Image(
-                ref_img, 
-                caption=f"Ref {j}: {predicted_class}"
-            )
+# Log reference images if available
+if predicted_class_samples:
+    for j, ref_sample in enumerate(reference_samples[:2], 1):  # Log first 2 reference images
+        ref_img = Image.open(ref_sample["path"])
+        if ref_img.mode != 'RGB':
+            ref_img = ref_img.convert('RGB')
+        wandb_log_data[f"single_test/reference_{j}"] = wandb.Image(
+            ref_img, 
+            caption=f"Ref {j}: {predicted_class}"
+        )
 
 wandb.log(wandb_log_data)
 wandb.finish()
+
+print(f"\n🎉 Vision classification test completed successfully!")
+print(f"Model achieved {confidence:.1%} confidence on the prediction.")
 # %%
+# Vision classification implementation completed
+# - Replaced text generation approach with direct vision classification
+# - Used Vision Tower + Linear classifier
+# - Implemented proper data collation and training
+# - Added comprehensive testing with confidence scores
