@@ -188,29 +188,8 @@ print(f"   Validation samples: {len(val_vision_dataset)}")
 print(f"   Validation ratio: {len(val_vision_dataset)/len(train_vision_dataset):.2%}")
 
 #%%
-# Vision Fine-tuning (exactly as in CLAUDE.md)
-print("\n🚀 Starting Vision Fine-tuning...")
-
-# Add PEFT configuration for quantized model
-model_SFT = FastVisionModel.get_peft_model(
-    model,
-    finetune_vision_layers = True,
-    finetune_language_layers = True,
-    finetune_attention_modules = True,
-    finetune_mlp_modules = True,
-    r = 32,  # LoRA rank
-    lora_alpha = 64,
-    lora_dropout = 0,  # Changed from 0.1 to 0 for Unsloth compatibility
-    bias = "none",
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "vision_embed"],
-    random_state = 3407,
-    use_gradient_checkpointing = "unsloth",
-)
-
-# Enable for training
-FastVisionModel.for_training(model_SFT)
-
-# Note: Using standard SFTTrainer for text-based classification
+# Vision Fine-tuning - Linear head only
+print("\n🚀 Starting Vision Fine-tuning (Linear head only)...")
 
 import torch
 import torch.nn.functional as F
@@ -221,97 +200,103 @@ from torch.utils.data import DataLoader
 from transformers.modeling_outputs import SequenceClassifierOutput
 import numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from transformers import TrainerCallback
 
-class VisionClassifier(nn.Module):
-    """Vision Tower + Linear分類器"""
-    def __init__(self, vision_model, num_classes, hidden_dim, pooling='mean'):
+
+def ConvBlock(in_channels, out_channels, pool=False):
+    layers = [nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+             nn.BatchNorm2d(out_channels),
+             nn.ReLU(inplace=True)]
+    if pool:
+        layers.append(nn.MaxPool2d(4))
+    return nn.Sequential(*layers)
+
+class ClearMemoryCallback(TrainerCallback):
+    """Callback that frees CUDA cache every `clear_every_n_steps` training steps."""
+    def __init__(self, clear_every_n_steps: int = 50):
+        self.clear_every_n_steps = clear_every_n_steps
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step and state.global_step % self.clear_every_n_steps == 0:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        return control
+
+class VisionCNNClassifier(nn.Module):
+    """Vision Tower特徴量 → CNN分類器のアーキテクチャ"""
+    def __init__(self, vision_model, num_classes, hidden_dim):
         super().__init__()
         self.vision_model = vision_model
-        self.pooling = pooling
-        self.classifier = nn.Linear(hidden_dim, num_classes)
-        self.dropout = nn.Dropout(0.1)
+        self.hidden_dim = hidden_dim
         
-        # Attention pooling用
-        if pooling == 'attention':
-            self.attention = nn.MultiheadAttention(hidden_dim, num_heads=8, batch_first=True)
-            self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        # Vision Towerの特徴量をfreezeする
+        for param in self.vision_model.parameters():
+            param.requires_grad = False
+        
+        # CNN分類器 (hidden_dimをin_channelsとして使用)
+        self.conv1 = ConvBlock(hidden_dim, 64)
+        self.conv2 = ConvBlock(64, 128, pool=True) 
+        self.res1 = nn.Sequential(ConvBlock(128, 128), ConvBlock(128, 128))
+        
+        self.conv3 = ConvBlock(128, 256, pool=True) 
+        self.conv4 = ConvBlock(256, 512, pool=True)
+        
+        self.res2 = nn.Sequential(ConvBlock(512, 512), ConvBlock(512, 512))
+        # 64x64 → conv2(16x16) → conv3(4x4) → conv4(1x1) になるため
+        # 1x1テンソルなのでMaxPool2dは不要、直接Flattenする
+        self.classifier = nn.Sequential(nn.Flatten(),
+                                       nn.Linear(512, num_classes))
     
-    def pool_features(self, features):
-        """特徴量をプーリングして1ベクトルに集約"""
-        # featuresの形状を確認してから処理
-        if len(features.shape) == 2:
-            # Already pooled features (B, hidden_dim)
-            return features
-        elif len(features.shape) == 3:
-            # features: (B, seq_len, hidden_dim) - Transformer形式
-            B, seq_len, hidden_dim = features.shape
-            
-            if self.pooling == 'mean':
-                return features.mean(dim=1)  # (B, hidden_dim)
-            
-            elif self.pooling == 'cls':
-                # 最初のトークンを使用
-                return features[:, 0, :]  # (B, hidden_dim)
-            
-            elif self.pooling == 'attention':
-                # CLSトークンを使ったattention pooling
-                cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, hidden_dim)
-                pooled, _ = self.attention(cls_tokens, features, features)
-                return pooled.squeeze(1)  # (B, hidden_dim)
-            
+    def extract_vision_features(self, pixel_values):
+        """Vision Towerから特徴量を抽出し、CNN用の形状に変換"""
+        with torch.no_grad():  # Vision Towerはfreezeされているのでgradient不要
+            vision_output = self.vision_model(pixel_values)
+            vision_features = vision_output.last_hidden_state
+        
+        # vision_featuresの形状を確認して、CNNが期待する形状に変換
+        if len(vision_features.shape) == 3:
+            # (B, seq_len, hidden_dim) -> spatial dimensionに変換
+            B, seq_len, hidden_dim = vision_features.shape
+            # seq_lenが完全平方数であることを仮定して、spatial dimensionに再形成
+            spatial_size = int(seq_len ** 0.5)
+            if spatial_size * spatial_size == seq_len:
+                # (B, hidden_dim, H, W) 形式に変換
+                vision_features = vision_features.transpose(1, 2).reshape(B, hidden_dim, spatial_size, spatial_size)
             else:
-                raise ValueError(f"Unknown pooling method: {self.pooling}")
-        elif len(features.shape) == 4:
-            # features: (B, channels, height, width) - CNN形式
-            B, C, H, W = features.shape
-            
-            if self.pooling == 'mean':
-                # Global Average Pooling
-                return features.mean(dim=[2, 3])  # (B, C)
-            
-            elif self.pooling == 'cls':
-                # Use center feature as "cls"
-                center_h, center_w = H // 2, W // 2
-                return features[:, :, center_h, center_w]  # (B, C)
-            
-            elif self.pooling == 'attention':
-                # Flatten spatial dimensions and apply attention
-                features_flat = features.view(B, C, H * W).transpose(1, 2)  # (B, H*W, C)
-                cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, C)
-                pooled, _ = self.attention(cls_tokens, features_flat, features_flat)
-                return pooled.squeeze(1)  # (B, C)
-            
-            else:
-                raise ValueError(f"Unknown pooling method: {self.pooling}")
+                # 完全平方数でない場合は、適当なサイズに調整
+                spatial_size = int(seq_len ** 0.5) + 1
+                pad_size = spatial_size * spatial_size - seq_len
+                if pad_size > 0:
+                    padding = torch.zeros(B, pad_size, hidden_dim, device=vision_features.device)
+                    vision_features = torch.cat([vision_features, padding], dim=1)
+                vision_features = vision_features.transpose(1, 2).reshape(B, hidden_dim, spatial_size, spatial_size)
+        elif len(vision_features.shape) == 4:
+            # 既に (B, C, H, W) 形式
+            pass
         else:
-            raise ValueError(f"Unexpected feature shape: {features.shape}")
+            raise ValueError(f"Unexpected vision_features shape: {vision_features.shape}")
+        
+        # AdaptiveAvgPool2dでCNNに適したサイズにリサイズ（64x64に設定）
+        adaptive_pool = nn.AdaptiveAvgPool2d((64, 64))
+        vision_features = adaptive_pool(vision_features)
+        
+        return vision_features
     
-    def forward(self, pixel_values, labels=None):
-        # Vision Towerから特徴量抽出
-        # TimmWrapperModelの場合は直接forwardを呼ぶ
-        vision_output = self.vision_model(pixel_values)
-        # TimmWrapperModelOutputから実際の特徴量を取得
-        vision_features = vision_output.last_hidden_state
+    def forward(self, pixel_values, **kwargs):
+        """ImageClassificationBaseと互換性のあるforward method"""
+        # Vision Towerから特徴量を抽出
+        vision_features = self.extract_vision_features(pixel_values)
         
+        # CNN layers through the network
+        out = self.conv1(vision_features)
+        out = self.conv2(out)
+        out = self.res1(out) + out
+        out = self.conv3(out)
+        out = self.conv4(out)
+        out = self.res2(out) + out
+        out = self.classifier(out)
         
-        # プーリングで1ベクトルに集約
-        pooled_features = self.pool_features(vision_features)
-        pooled_features = self.dropout(pooled_features)
-        
-        # 分類
-        logits = self.classifier(pooled_features)  # (B, num_classes)
-        
-        loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
-            
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=None,
-            attentions=None
-        )
+        return out
 
 def compute_vision_metrics(eval_pred):
     """Vision分類用の評価メトリクス"""
@@ -361,14 +346,24 @@ class VisionClassificationTrainer(Trainer):
         pixel_values = inputs.get('pixel_values')
         labels = inputs.get('labels')  # クラスIDの形式 (B,)
         
-        # モデルの前向き計算
-        outputs = model(pixel_values=pixel_values, labels=labels)
-        loss = outputs.loss
+        # 通常のforward()でlogitsを取得
+        logits = model(pixel_values)
         
+        # 損失計算
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits, labels)
+        
+        # SequenceClassifierOutput形式で返す (metricsのため)
+        from transformers.modeling_outputs import SequenceClassifierOutput
+        outputs = SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=None,
+            attentions=None
+        )
         
         return (loss, outputs) if return_outputs else loss
-
-# ClassCETrainer削除 - Vision分類のみを使用
 
 # Vision分類用のデータコレーター
 class VisionDataCollator:
@@ -402,10 +397,8 @@ class VisionDataCollator:
 # Vision Towerを取得してVisionClassifierを作成
 print("🔍 Extracting Vision Tower from model...")
 
-# PeftModelの階層を辿ってvision_towerを取得
-base_model = model_SFT.base_model.model.model  # Gemma3nForConditionalGeneration
-# base_model is already Gemma3nModel, so access vision_tower directly
-vision_tower = base_model.vision_tower
+# 直接modelからvision_towerを取得
+vision_tower = model.model.vision_tower
 
 # Hidden dimensionを取得
 hidden_dim = vision_tower.config.hidden_size if hasattr(vision_tower, 'config') else 3584  # Gemma3nのデフォルト
@@ -414,12 +407,11 @@ print(f"Vision Tower: {type(vision_tower)}")
 print(f"Hidden dimension: {hidden_dim}")
 print(f"Number of classes: {len(class_names)}")
 
-# VisionClassifierを作成
-vision_classifier = VisionClassifier(
+# VisionCNNClassifierを作成
+vision_classifier = VisionCNNClassifier(
     vision_model=vision_tower,
     num_classes=len(class_names),
-    hidden_dim=hidden_dim,
-    pooling='mean'  # mean, cls, attention から選択
+    hidden_dim=hidden_dim
 )
 
 # Vision分類用のトレーナーを作成
@@ -431,12 +423,13 @@ vision_trainer = VisionClassificationTrainer(
     train_dataset=train_vision_dataset,
     eval_dataset=val_vision_dataset,
     compute_metrics=compute_vision_metrics,
+    callbacks=[ClearMemoryCallback(clear_every_n_steps=50)],
     args=SFTConfig(
-        per_device_train_batch_size=16,  
+        per_device_train_batch_size=8,  
         per_device_eval_batch_size=16,
         gradient_accumulation_steps=8,  
         warmup_steps=5,
-        max_steps=300,  # より長い学習で性能向上
+        max_steps=150,  # より長い学習で性能向上
         learning_rate=1e-3,  # Vision分類では少し高めのLR
         fp16=not is_bf16_supported(),
         bf16=is_bf16_supported(),
@@ -453,14 +446,14 @@ vision_trainer = VisionClassificationTrainer(
         run_name="gemma3n-vision-classification",
         
         eval_strategy="steps",
-        eval_steps=50,  # 30ステップごとに評価（より多くのステップに対応）
-        eval_delay=20,  # 最初の20ステップ後から評価開始
+        eval_steps=5,
+        eval_delay=20,
         
         save_strategy="steps",
         save_steps=50,  # eval_stepsと同じ値に設定
         save_total_limit=3,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_accuracy",
+        metric_for_best_model='eval_accuracy', 
         greater_is_better=True,
         
         dataloader_pin_memory=False,
@@ -476,7 +469,6 @@ print(f"📊 Validation samples: {len(val_vision_dataset)}")
 # Start Vision Classification Training
 print("📈 Vision Classification Training started...")
 print("🎯 Using Vision Tower + Linear Classifier approach")
-print(f"🔧 Pooling method: {vision_classifier.pooling}")
 
 # Vision分類でトレーニング
 vision_trainer.train()
