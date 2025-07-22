@@ -28,7 +28,8 @@ from collections import defaultdict
 from torchvision import datasets
 from unsloth import FastModel, is_bf16_supported, FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer
+from transformers import TrainingArguments, Trainer
 import wandb
 from PIL import Image
 from IPython.display import display, Image as IPImage
@@ -298,6 +299,195 @@ class VisionCNNClassifier(nn.Module):
         
         return out
 
+# ID/Label変換ユーティリティ関数
+def id_to_label(class_id, class_names_list=None):
+    """クラスIDをクラス名に変換
+    
+    Args:
+        class_id (int): クラスID (0 ~ len(class_names)-1)
+        class_names_list (list, optional): クラス名リスト。Noneの場合はグローバルのclass_namesを使用
+    
+    Returns:
+        str: クラス名
+    """
+    if class_names_list is None:
+        class_names_list = class_names
+    return class_names_list[class_id]
+
+def ids_to_labels(class_ids, class_names_list=None):
+    """クラスIDリスト/配列をクラス名リストに変換
+    
+    Args:
+        class_ids (list/array): クラスIDのリストまたは配列
+        class_names_list (list, optional): クラス名リスト。Noneの場合はグローバルのclass_namesを使用
+    
+    Returns:
+        list: クラス名のリスト
+    """
+    if class_names_list is None:
+        class_names_list = class_names
+    return [class_names_list[id] for id in class_ids]
+
+def get_top_k_predictions(logits, k=3, class_names_list=None):
+    """logitsからTop-K予測とその確信度を返す
+    
+    Args:
+        logits (torch.Tensor): モデルの出力logits (batch_size, num_classes)
+        k (int): 上位何個まで取得するか
+        class_names_list (list, optional): クラス名リスト。Noneの場合はグローバルのclass_namesを使用
+    
+    Returns:
+        list: バッチ内各サンプルのTop-K予測結果
+              [{'class_id': int, 'class_name': str, 'confidence': float}, ...]
+    """
+    import torch
+    
+    if class_names_list is None:
+        class_names_list = class_names
+    
+    # logitsが1次元の場合(単一サンプル)は2次元に変換
+    if len(logits.shape) == 1:
+        logits = logits.unsqueeze(0)
+    
+    # 確率に変換してTop-K取得
+    probs = torch.softmax(logits, dim=-1)
+    top_k_probs, top_k_ids = torch.topk(probs, k, dim=-1)
+    
+    results = []
+    for i in range(len(top_k_ids)):
+        predictions = []
+        for j in range(k):
+            class_id = top_k_ids[i][j].item()
+            confidence = top_k_probs[i][j].item()
+            class_name = class_names_list[class_id]
+            predictions.append({
+                'class_id': class_id,
+                'class_name': class_name,
+                'confidence': confidence
+            })
+        results.append(predictions)
+    
+    return results
+
+# スマート適応的予測システム
+def do_gemma_3n_inference(messages, max_new_tokens=128):
+    """Vision生成機能 - CLAUDE.mdから復活"""
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to("cuda")
+    
+    # 常に出力をキャプチャして返す
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=1.0, top_p=0.95, top_k=64,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    # 新しく生成されたトークンのみを抽出
+    response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+    response_text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+    return response_text
+
+def check_if_plant_disease_image(image):
+    """Vision生成機能で植物病気関連画像かを判定"""
+    messages = [
+        {"role": "user", 
+         "content": [
+             {"type": "text", "text": "Is this image related to plant diseases or plant health issues? Answer only 'YES' or 'NO' and briefly explain why."},
+             {"type": "image", "image": image}
+         ]}
+    ]
+    
+    # Vision生成で判定
+    response = do_gemma_3n_inference(messages, max_new_tokens=50)
+    
+    # 'YES'が含まれているかをチェック
+    is_plant_disease = 'YES' in response.upper()
+    
+    return is_plant_disease, response
+
+def generate_detailed_description(image):
+    """一般画像の詳細説明生成"""
+    messages = [
+        {"role": "user", 
+         "content": [
+             {"type": "text", "text": "Describe accurately and in detail what you see in this image."},
+             {"type": "image", "image": image}
+         ]}
+    ]
+    
+    return do_gemma_3n_inference(messages, max_new_tokens=150)
+
+def smart_predict_image(image):
+    """
+    スマート予測: Classifier → 信頼度チェック → 必要時Vision判定
+    
+    Args:
+        image: PIL Image
+    
+    Returns:
+        dict: 予測結果辞書
+    """
+    # データコレーターを使用してpixel_valuesを準備
+    test_sample = {"image": image, "labels": 0}  # ダミーラベル
+    batch = vision_trainer.data_collator([test_sample])
+    pixel_values = batch["pixel_values"].to("cuda")
+    
+    # Step 1: Classifierで予測
+    with torch.no_grad():
+        logits = vision_classifier(pixel_values=pixel_values)
+        top_predictions = get_top_k_predictions_local(logits, k=3)
+        max_confidence = top_predictions[0][0]['confidence']
+    
+    print(f"🔍 Classifier予測: {top_predictions[0][0]['class_name']} (信頼度: {max_confidence:.1%})")
+    
+    # Step 2: 信頼度チェック
+    if max_confidence >= 0.7:  # 高信頼度
+        print("✅ 高信頼度のため、Classifier結果を採用")
+        return {
+            'prediction': top_predictions[0][0]['class_name'],
+            'confidence': max_confidence,
+            'method': 'classifier',
+            'reason': f'高信頼度 ({max_confidence:.1%})',
+            'top_alternatives': top_predictions[0][:3]
+        }
+    else:
+        # Step 3: Vision生成で植物病気関連かを判定
+        print("🤔 信頼度が低いため、Vision生成で画像内容を確認中...")
+        is_plant_disease, vision_response = check_if_plant_disease_image(image)
+        print(f"🧠 Vision判定: {'植物病気関連' if is_plant_disease else '植物病気以外'}")
+        print(f"📝 Vision応答: {vision_response}")
+        
+        if is_plant_disease:
+            # 植物病気関連 → Classifierの結果を使用
+            print("🌱 植物病気と確認されたため、Classifier結果を採用")
+            return {
+                'prediction': top_predictions[0][0]['class_name'],
+                'confidence': max_confidence,
+                'method': 'classifier_confirmed',
+                'reason': f'Vision生成により植物病気と確認 (分類信頼度: {max_confidence:.1%})',
+                'top_alternatives': top_predictions[0][:3],
+                'vision_confirmation': True,
+                'vision_response': vision_response
+            }
+        else:
+            # 植物病気関連でない → Vision生成で詳細説明
+            print("📝 一般画像として、Vision生成で詳細説明を作成中...")
+            description = generate_detailed_description(image)
+            return {
+                'description': description,
+                'method': 'vision_generation',
+                'reason': 'Vision生成により植物病気以外と判定',
+                'confidence': 0.8,  # 生成ベース
+                'vision_analysis': True,
+                'vision_response': vision_response
+            }
+
 def compute_vision_metrics(eval_pred):
     """Vision分類用の評価メトリクス"""
     predictions, labels = eval_pred
@@ -327,43 +517,46 @@ def compute_vision_metrics(eval_pred):
         'std_class_accuracy': np.std(class_accuracies),
     }
     
-    # 全クラスの精度を追加
-    for i, acc in enumerate(class_accuracies):
-        metrics[f'class_{i}_accuracy'] = acc
-    
     return metrics
 
-class VisionClassificationTrainer(Trainer):
-    """Vision分類用のTrainer"""
-    
-    def __init__(self, model, class_names, *args, **kwargs):
-        super().__init__(model=model, *args, **kwargs)
-        self.class_names = class_names
-        self.num_classes = len(class_names)
+class VisionTrainer(Trainer):
+    """Vision分類用の軽量Trainer - compute_metricsを妨げない"""
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # pixel_valuesとlabelsを取得
         pixel_values = inputs.get('pixel_values')
-        labels = inputs.get('labels')  # クラスIDの形式 (B,)
+        labels = inputs.get('labels')
         
-        # 通常のforward()でlogitsを取得
+        # モデルのforward()でlogitsを取得
         logits = model(pixel_values)
         
-        # 損失計算
-        loss = None
-        if labels is not None:
+        # Cross entropy lossを計算
+        loss = F.cross_entropy(logits, labels)
+        
+        if return_outputs:
+            # Trainerが期待する形式でoutputsを返す
+            outputs = type('ModelOutput', (), {
+                'loss': loss,
+                'logits': logits,
+            })()
+            return loss, outputs
+        return loss
+    
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """評価時の予測ステップをオーバーライド"""
+        pixel_values = inputs.get('pixel_values')
+        labels = inputs.get('labels')
+        
+        with torch.no_grad():
+            # モデルの予測を取得
+            logits = model(pixel_values)
             loss = F.cross_entropy(logits, labels)
         
-        # SequenceClassifierOutput形式で返す (metricsのため)
-        from transformers.modeling_outputs import SequenceClassifierOutput
-        outputs = SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=None,
-            attentions=None
-        )
+        # prediction_loss_onlyがTrueの場合はlossのみ返す
+        if prediction_loss_only:
+            return (loss, None, None)
         
-        return (loss, outputs) if return_outputs else loss
+        # compute_metricsで使用するため、logitsとlabelsを返す
+        return (loss, logits, labels)
 
 # Vision分類用のデータコレーター
 class VisionDataCollator:
@@ -415,21 +608,20 @@ vision_classifier = VisionCNNClassifier(
 )
 
 # Vision分類用のトレーナーを作成
-vision_trainer = VisionClassificationTrainer(
+vision_trainer = VisionTrainer(
     model=vision_classifier,
-    class_names=class_names,
     tokenizer=tokenizer,
     data_collator=VisionDataCollator(tokenizer),
     train_dataset=train_vision_dataset,
     eval_dataset=val_vision_dataset,
     compute_metrics=compute_vision_metrics,
     callbacks=[ClearMemoryCallback(clear_every_n_steps=50)],
-    args=SFTConfig(
+    args=TrainingArguments(
         per_device_train_batch_size=8,  
         per_device_eval_batch_size=16,
         gradient_accumulation_steps=8,  
         warmup_steps=5,
-        max_steps=150,  # より長い学習で性能向上
+        max_steps=100, # より長い学習で性能向上
         learning_rate=1e-3,  # Vision分類では少し高めのLR
         fp16=not is_bf16_supported(),
         bf16=is_bf16_supported(),
@@ -446,14 +638,14 @@ vision_trainer = VisionClassificationTrainer(
         run_name="gemma3n-vision-classification",
         
         eval_strategy="steps",
-        eval_steps=5,
+        eval_steps=25,
         eval_delay=20,
         
         save_strategy="steps",
-        save_steps=50,  # eval_stepsと同じ値に設定
+        save_steps=50,
         save_total_limit=3,
         load_best_model_at_end=True,
-        metric_for_best_model='eval_accuracy', 
+        metric_for_best_model="eval_accuracy",
         greater_is_better=True,
         
         dataloader_pin_memory=False,
@@ -467,22 +659,17 @@ print(f"📊 Training samples: {len(train_vision_dataset)}")
 print(f"📊 Validation samples: {len(val_vision_dataset)}")
 
 # Start Vision Classification Training
-print("📈 Vision Classification Training started...")
-print("🎯 Using Vision Tower + Linear Classifier approach")
-
-# Vision分類でトレーニング
 vision_trainer.train()
 
 print("🎉 Vision Classification Training completed!")
 print(f"💾 Model saved to: ./vision_classification_outputs")
-
 print(f"📝 Model trained with Vision Classification for {len(class_names)} classes")
+
 model_type = "vision_tower_classification"
 log_data = {
     "training_status": "completed", 
     "model_type": model_type,
     "num_classes": len(class_names),
-    "pooling_method": vision_classifier.pooling,
     "hidden_dim": hidden_dim
 }
 
@@ -508,8 +695,7 @@ with torch.no_grad():
     pixel_values = batch["pixel_values"].to("cuda")
     
     # Get prediction
-    outputs = vision_classifier(pixel_values=pixel_values)
-    logits = outputs.logits
+    logits = vision_classifier(pixel_values=pixel_values)
     predicted_class_id = torch.argmax(logits, dim=-1).item()
     predicted_class = class_names[predicted_class_id]
     
@@ -521,6 +707,111 @@ with torch.no_grad():
 
 print(f"✅ Vision classification test completed!")
 print("=" * 50)
+
+# Test ID/Label conversion functions
+print("\n🔧 Testing ID/Label conversion functions...")
+print("-" * 50)
+
+# Define conversion functions here for Jupyter compatibility
+def id_to_label_local(class_id, class_names_list=None):
+    """クラスIDをクラス名に変換"""
+    if class_names_list is None:
+        class_names_list = class_names
+    return class_names_list[class_id]
+
+def ids_to_labels_local(class_ids, class_names_list=None):
+    """クラスIDリスト/配列をクラス名リストに変換"""
+    if class_names_list is None:
+        class_names_list = class_names
+    return [class_names_list[id] for id in class_ids]
+
+def get_top_k_predictions_local(logits, k=3, class_names_list=None):
+    """logitsからTop-K予測とその確信度を返す"""
+    import torch
+    
+    if class_names_list is None:
+        class_names_list = class_names
+    
+    # logitsが1次元の場合(単一サンプル)は2次元に変換
+    if len(logits.shape) == 1:
+        logits = logits.unsqueeze(0)
+    
+    # 確率に変換してTop-K取得
+    probs = torch.softmax(logits, dim=-1)
+    top_k_probs, top_k_ids = torch.topk(probs, k, dim=-1)
+    
+    results = []
+    for i in range(len(top_k_ids)):
+        predictions = []
+        for j in range(k):
+            class_id = top_k_ids[i][j].item()
+            confidence = top_k_probs[i][j].item()
+            class_name = class_names_list[class_id]
+            predictions.append({
+                'class_id': class_id,
+                'class_name': class_name,
+                'confidence': confidence
+            })
+        results.append(predictions)
+    
+    return results
+
+# Test 1: id_to_label function
+test_id = predicted_class_id
+converted_label = id_to_label_local(test_id)
+print(f"📍 Test 1 - id_to_label({test_id}) = '{converted_label}'")
+
+# Test 2: ids_to_labels function
+test_ids = [0, 5, 10, predicted_class_id]
+converted_labels = ids_to_labels_local(test_ids)
+print(f"📍 Test 2 - ids_to_labels({test_ids}):")
+for i, label in enumerate(converted_labels):
+    print(f"   ID {test_ids[i]} → '{label}'")
+
+# Test 3: get_top_k_predictions function
+top3_predictions = get_top_k_predictions_local(logits, k=3)
+print(f"📍 Test 3 - Top-3 predictions:")
+for i, pred in enumerate(top3_predictions[0]):  # 最初のサンプルのTop-3
+    print(f"   {i+1}. {pred['class_name']} (ID: {pred['class_id']}, confidence: {pred['confidence']:.3f})")
+
+print("\n" + "=" * 70)
+print("🧠 スマート適応的予測システムのテスト")
+print("=" * 70)
+
+# Test smart prediction system
+print(f"\n🎯 テスト画像でスマート予測を実行...")
+print(f"🖼️ テスト対象: {actual_class}")
+
+# Execute smart prediction
+smart_result = smart_predict_image(test_image)
+
+# Display results
+print(f"\n📊 スマート予測結果:")
+print(f"   使用手法: {smart_result['method']}")
+print(f"   理由: {smart_result['reason']}")
+
+if 'prediction' in smart_result:
+    print(f"   予測クラス: {smart_result['prediction']}")
+    print(f"   信頼度: {smart_result['confidence']:.1%}")
+    if 'top_alternatives' in smart_result:
+        print("   代替候補:")
+        for i, alt in enumerate(smart_result['top_alternatives'][:3], 1):
+            print(f"      {i}. {alt['class_name']} ({alt['confidence']:.1%})")
+
+if 'description' in smart_result:
+    print(f"   生成された説明: {smart_result['description']}")
+
+if 'vision_response' in smart_result:
+    print(f"   Vision判定詳細: {smart_result['vision_response']}")
+
+# 正解と比較
+if 'prediction' in smart_result:
+    is_correct = smart_result['prediction'] == actual_class
+    print(f"\n🎯 予測結果: {'✅ 正解' if is_correct else '❌ 不正解'}")
+    print(f"   実際: {actual_class}")
+    print(f"   予測: {smart_result['prediction']}")
+
+print("\n" + "=" * 70)
 
 # Display the test image
 display(test_image)
@@ -684,9 +975,10 @@ wandb.finish()
 
 print(f"\n🎉 Vision classification test completed successfully!")
 print(f"Model achieved {confidence:.1%} confidence on the prediction.")
+
 # %%
 # Vision classification implementation completed
-# - Replaced text generation approach with direct vision classification
+# - Replaced text generation approach with direct vision classification  
 # - Used Vision Tower + Linear classifier
 # - Implemented proper data collation and training
 # - Added comprehensive testing with confidence scores
