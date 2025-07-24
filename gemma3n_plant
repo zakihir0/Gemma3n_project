@@ -982,3 +982,4 @@ print(f"Model achieved {confidence:.1%} confidence on the prediction.")
 # - Used Vision Tower + Linear classifier
 # - Implemented proper data collation and training
 # - Added comprehensive testing with confidence scores
+# Show all class names for caption generation reference

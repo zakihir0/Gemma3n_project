@@ -1,0 +1,374 @@
+#%%
+# Vision Fine-tuning for plnat Classification - CLAUDE.md Based
+
+!pip uninstall -y pygobject gradient gradient-utils
+!pip install --no-cache-dir --upgrade packaging==24.2
+!pip install --no-deps bitsandbytes accelerate xformers==0.0.29.post3 peft trl triton cut_cross_entropy unsloth_zoo
+!pip install --upgrade bitsandbytes
+!pip install triton==3.2.0
+!pip install pip3-autoremove
+!pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+!pip install unsloth
+!pip install faiss-cpu
+!pip install sentence-transformers
+!pip install wikipedia
+!pip install --no-deps git+https://github.com/huggingface/transformers.git
+!pip install --no-deps --upgrade timm
+!pip uninstall -y deepspeed
+!pip install deepspeed==0.14.4
+!pip install wandb==0.17.9
+
+#%%
+import os
+import random
+import pandas as pd
+import json
+import torch
+from typing import List
+from collections import defaultdict
+from torchvision import datasets
+from unsloth import FastModel, is_bf16_supported, FastVisionModel
+from unsloth.trainer import UnslothVisionDataCollator
+from trl import SFTTrainer, SFTConfig
+from transformers import TrainingArguments, Trainer
+import wandb
+from PIL import Image
+from IPython.display import display, Image as IPImage
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
+os.environ["WANDB_API_KEY"] = "abd0ce2837eca439d66f6c603136603c1729cd3e"
+
+#%%
+# Initialize WandB with environment variable login
+wandb.login(key=os.getenv("WANDB_API_KEY"))
+
+wandb.init(
+    project="gemma3n-plant-classification",
+    name="vision-finetuning-experiment",
+    config={
+        "model_name": "unsloth/gemma-3n-E2B-it",
+        "max_seq_length": 1024,
+        "load_in_4bit": True,
+        "max_val_samples_for_sft": 200,
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "learning_rate": 1e-4,
+        "max_steps": 300,
+        "eval_steps": 30,
+        "per_device_train_batch_size": 8,
+        "per_device_eval_batch_size": 8,
+        "gradient_accumulation_steps": 8,
+    }
+)
+
+# Load the model (exactly as in CLAUDE.md)
+model, tokenizer = FastModel.from_pretrained(
+    model_name = "unsloth/gemma-3n-E2B-it",
+    dtype = None,
+    max_seq_length = 1024,
+    load_in_4bit = True,
+    full_finetuning = False,
+)
+
+#%%
+# Data loading using existing train/valid split
+base_dir = '/notebooks/kaggle/input/new_plant_diseases/2/New Plant Diseases Dataset(Augmented)/New Plant Diseases Dataset(Augmented)'
+train_dir = os.path.join(base_dir, 'train')
+valid_dir = os.path.join(base_dir, 'valid')
+
+print("📊 Loading dataset...")
+
+def load_dataset_from_dir(root_dir):
+    """Load dataset from directory"""
+    classes = []
+    paths = []
+    class_file_counts = {}
+    
+    for dirname, _, filenames in os.walk(root_dir):
+        class_name = dirname.split('/')[-1]
+        if class_name == os.path.basename(root_dir):  # Skip root directory
+            continue
+            
+        if class_name not in class_file_counts:
+            class_file_counts[class_name] = 0
+        
+        for filename in filenames:
+            if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                full_path = os.path.join(dirname, filename)
+                if os.path.exists(full_path):
+                    classes.append(class_name)
+                    paths.append(full_path)
+                    class_file_counts[class_name] += 1
+    
+    return classes, paths, class_file_counts
+
+# Load train and validation datasets
+train_classes, train_paths, train_counts = load_dataset_from_dir(train_dir)
+val_classes, val_paths, val_counts = load_dataset_from_dir(valid_dir)
+
+# Get unified class names from ImageFolder for consistency
+train_dataset_folder = datasets.ImageFolder(root=train_dir)
+class_names = train_dataset_folder.classes
+print(f"Class names: {class_names}")
+print(f"Number of classes: {len(class_names)}")
+
+# Class to caption mapping dictionary
+class_to_caption = {
+    "Apple___Apple_scab": "This image shows apple leaves affected by apple scab disease, characterized by dark, scaly lesions on the leaf surface.",
+    "Apple___Black_rot": "This image shows apple affected by black rot disease, displaying characteristic dark, rotting areas on the fruit or foliage.",
+    "Apple___Cedar_apple_rust": "This image shows apple leaves with cedar apple rust, exhibiting orange-yellow spots and lesions typical of this fungal disease.",
+    "Apple___healthy": "This image shows a healthy apple plant with vibrant green leaves and no visible signs of disease or pest damage.",
+    "Blueberry___healthy": "This image shows a healthy blueberry plant with normal leaf coloration and no visible signs of disease or stress.",
+    "Cherry_(including_sour)___Powdery_mildew": "This image shows cherry leaves affected by powdery mildew, with characteristic white powdery fungal growth on the leaf surface.",
+    "Cherry_(including_sour)___healthy": "This image shows a healthy cherry plant with normal leaf appearance and no visible disease symptoms.",
+    "Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot": "This image shows corn leaves with cercospora leaf spot and gray leaf spot, displaying rectangular grayish lesions with distinct borders.",
+    "Corn_(maize)___Common_rust_": "This image shows corn leaves affected by common rust, characterized by small, reddish-brown pustules scattered across the leaf surface.",
+    "Corn_(maize)___Northern_Leaf_Blight": "This image shows corn leaves with northern leaf blight, displaying large, elliptical, grayish-green lesions with dark borders.",
+    "Corn_(maize)___healthy": "This image shows healthy corn plants with vibrant green leaves and no visible signs of disease or pest damage.",
+    "Grape___Black_rot": "This image shows grape foliage affected by black rot, with characteristic dark, circular lesions and possible fruit mummification.",
+    "Grape___Esca_(Black_Measles)": "This image shows grape leaves with esca disease (black measles), displaying characteristic yellowing between veins and dark streaking patterns.",
+    "Grape___Leaf_blight_(Isariopsis_Leaf_Spot)": "This image shows grape leaves affected by isariopsis leaf spot, with dark brown to black spots surrounded by yellow halos.",
+    "Grape___healthy": "This image shows healthy grape vines with normal leaf coloration and structure, free from disease symptoms.",
+    "Orange___Haunglongbing_(Citrus_greening)": "This image shows citrus affected by huanglongbing (citrus greening disease), with characteristic yellowing, mottling, and asymmetric leaf patterns.",
+    "Peach___Bacterial_spot": "This image shows peach leaves affected by bacterial spot, displaying small, dark lesions with yellow halos on the leaf surface.",
+    "Peach___healthy": "This image shows a healthy peach plant with normal leaf appearance and no visible signs of disease or pest damage.",
+    "Pepper,_bell___Bacterial_spot": "This image shows bell pepper leaves affected by bacterial spot, with dark, water-soaked lesions surrounded by yellow halos.",
+    "Pepper,_bell___healthy": "This image shows healthy bell pepper plants with vibrant green leaves and no visible disease symptoms.",
+    "Potato___Early_blight": "This image shows potato foliage affected by early blight, with characteristic dark, concentric ring lesions on the leaves.",
+    "Potato___Late_blight": "This image shows potato plants affected by late blight, displaying dark, water-soaked lesions that may have white fuzzy growth on leaf undersides.",
+    "Potato___healthy": "This image shows healthy potato plants with normal green foliage and no visible signs of disease or stress.",
+    "Raspberry___healthy": "This image shows a healthy raspberry plant with normal leaf structure and coloration, free from disease symptoms.",
+    "Soybean___healthy": "This image shows healthy soybean plants with characteristic trifoliate leaves and no visible signs of disease or pest damage.",
+    "Squash___Powdery_mildew": "This image shows squash leaves affected by powdery mildew, with white, powdery fungal growth covering portions of the leaf surface.",
+    "Strawberry___Leaf_scorch": "This image shows strawberry leaves affected by leaf scorch, with characteristic brown, scorched margins and purplish-red lesions.",
+    "Strawberry___healthy": "This image shows healthy strawberry plants with normal trifoliate leaves and no visible disease symptoms.",
+    "Tomato___Bacterial_spot": "This image shows tomato leaves affected by bacterial spot, displaying small, dark spots with yellow halos scattered across the leaf surface.",
+    "Tomato___Early_blight": "This image shows tomato foliage affected by early blight, with characteristic dark lesions showing concentric ring patterns.",
+    "Tomato___Late_blight": "This image shows tomato plants affected by late blight, with dark, water-soaked lesions and potential white fuzzy growth on leaf undersides.",
+    "Tomato___Leaf_Mold": "This image shows tomato leaves affected by leaf mold, typically displaying yellowing on upper leaf surfaces with fuzzy growth underneath.",
+    "Tomato___Septoria_leaf_spot": "This image shows tomato leaves with septoria leaf spot, characterized by small, circular spots with dark borders and light centers.",
+    "Tomato___Spider_mites Two-spotted_spider_mite": "This image shows tomato leaves damaged by two-spotted spider mites, with stippling, yellowing, and possible webbing visible on the foliage.",
+    "Tomato___Target_Spot": "This image shows tomato leaves affected by target spot, displaying circular lesions with concentric rings resembling a target pattern.",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus": "This image shows tomato plants infected with yellow leaf curl virus, exhibiting upward curling, yellowing, and stunted growth of leaves.",
+    "Tomato___Tomato_mosaic_virus": "This image shows tomato leaves infected with mosaic virus, displaying characteristic mottled patterns of light and dark green areas.",
+    "Tomato___healthy": "This image shows healthy tomato plants with normal green foliage and no visible signs of disease, pest damage, or viral infection."
+}
+
+print(f"\n📝 Generated captions for {len(class_to_caption)} classes")
+
+# Create mapping
+N = list(range(len(class_names)))
+normal_mapping = dict(zip(class_names, N))
+reverse_mapping = dict(zip(N, class_names))
+
+def create_dataset_with_captions(paths, classes, class_names, class_to_caption):
+    """Create dataset with paths, classes, captions, and vision processing"""
+    dataset = []
+    normal_mapping = {cls: idx for idx, cls in enumerate(class_names)}
+    
+    for path, class_name in zip(paths, classes):
+        # Get caption for this class
+        caption = class_to_caption.get(class_name, class_name)
+        
+        # Load and process image for vision
+        image = Image.open(path)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Get class ID
+        class_id = normal_mapping[class_name]
+        
+        dataset.append({
+            "path": path,
+            "class": class_name,
+            "caption": caption,
+            "image": image,
+            "labels": class_id
+        })
+    
+    return dataset
+
+# Create train and validation datasets
+train_dataset = create_dataset_with_captions(train_paths, train_classes, class_names, class_to_caption)
+val_dataset = create_dataset_with_captions(val_paths, val_classes, class_names, class_to_caption)
+
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Train class distribution: {train_counts}")
+print(f"Val class distribution: {val_counts}")
+
+# Show sample from dataset
+print("\n📋 Sample dataset entry:")
+print(f"Image type: {type(train_dataset[0]['image'])}")
+print(f"Label: {train_dataset[0]['labels']} (class: {class_names[train_dataset[0]['labels']]})")
+print(f"Caption: {train_dataset[0]['caption']}")
+
+print(f"\n📊 Final dataset split:")
+print(f"   Training samples: {len(train_dataset)}")
+print(f"   Validation samples: {len(val_dataset)}")
+print(f"   Validation ratio: {len(val_dataset)/len(train_dataset):.2%}")
+
+# Convert to conversation format (exactly as in CLAUDE.md)
+instruction = "You are an expert of plant diseases and health. Describe accurately what you see in this image."
+
+def convert_to_conversation(sample):
+    # Use already processed image from sample if available, otherwise load it
+    if "image" in sample:
+        image = sample["image"]
+    else:
+        image = Image.open(sample["path"])
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+    
+    conversation = [
+        { "role": "user",
+            "content" : [
+            {"type" : "text",  "text"  : instruction},
+            {"type" : "image", "image" : image} ]
+        },
+        { "role" : "assistant",
+            "content" : [
+            {"type" : "text",  "text"  : sample["caption"]} ]
+        },
+    ]
+    return { "messages" : conversation }
+
+# Convert datasets to conversation format for SFT
+train_conversation_dataset = [convert_to_conversation(sample) for sample in train_dataset]
+train_conversation_dataset = [item for item in train_conversation_dataset if item is not None]
+
+val_conversation_dataset = [convert_to_conversation(sample) for sample in val_dataset]
+val_conversation_dataset = [item for item in val_conversation_dataset if item is not None]
+
+# Limit validation dataset size for faster evaluation
+max_val_samples = 200  # From WandB config: max_val_samples_for_sft
+if len(val_conversation_dataset) > max_val_samples:
+    import random
+    random.seed(3407)  # For reproducible results
+    val_conversation_dataset = random.sample(val_conversation_dataset, max_val_samples)
+
+print(f"✅ Converted {len(train_conversation_dataset)} training samples to conversation format")
+print(f"✅ Using {len(val_conversation_dataset)} validation samples (limited for faster evaluation)")
+
+# Show sample conversation
+print("\n📋 Sample conversation:")
+sample_conv = train_conversation_dataset[0]
+print(f"User instruction: {sample_conv['messages'][0]['content'][0]['text']}")
+print(f"Assistant caption: {sample_conv['messages'][1]['content'][0]['text']}")
+print(f"Image type: {type(sample_conv['messages'][0]['content'][1]['image'])}")
+
+#%%
+# Add PEFT configuration for quantized model
+peft_model = FastVisionModel.get_peft_model(
+    model,
+    finetune_vision_layers = True,
+    finetune_language_layers = True,
+    finetune_attention_modules = True,
+    finetune_mlp_modules = True,
+    r = 8,  # LoRA rank
+    lora_alpha = 16,
+    lora_dropout = 0,
+    bias = "none",
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj","vision_embed","tok_embeddings"],
+    random_state = 3407,
+    use_gradient_checkpointing = "unsloth",
+)
+
+# Enable for training
+FastVisionModel.for_training(peft_model)
+
+# Create trainer with validation dataset and evaluation settings
+trainer = SFTTrainer(
+    model = peft_model,
+    tokenizer = tokenizer,
+    data_collator = UnslothVisionDataCollator(peft_model, tokenizer), # Must use!
+    train_dataset = train_conversation_dataset,
+    eval_dataset = val_conversation_dataset,
+    args = SFTConfig(
+        per_device_train_batch_size = 4,  # Reduced for vision + text processing
+        per_device_eval_batch_size = 2,   # Validation batch size
+        gradient_accumulation_steps = 8,  # Maintain effective batch size
+        warmup_steps = 10,
+        max_steps = 100,  # Reasonable steps for testing
+        learning_rate = 1e-4,
+        fp16 = not is_bf16_supported(),
+        bf16 = is_bf16_supported(),
+        logging_steps = 10,
+        optim = "adamw_8bit",
+        weight_decay = 0.01,
+        lr_scheduler_type = "linear",
+        seed = 3407,
+        output_dir = "./plant_vision_outputs",
+        report_to = "wandb",
+        run_name = "gemma3n-plant-vision-ft",
+        deepspeed = None,
+        dataloader_pin_memory = False,  # Disable pin memory to avoid conflicts
+        dataloader_num_workers = 0,    # Disable multiprocessing to avoid issues
+        
+        # Evaluation settings
+        eval_strategy = "steps",         # Evaluate every eval_steps
+        eval_steps = 20,                 # Evaluate every 20 steps
+        save_strategy = "steps",         # Save every save_steps
+        save_steps = 20,                 # Save every 20 steps (aligned with eval)
+
+        # You MUST put the below items for vision finetuning (from CLAUDE.md):
+        remove_unused_columns = False,
+        dataset_text_field = "",
+        dataset_kwargs = {"skip_prepare_dataset": True},
+        dataset_num_proc = 1,
+        max_seq_length = 2048,
+    ),
+)
+
+# Start training
+print("📈 Training started...")
+trainer.train()
+
+print("🎉 Training completed!")
+print(f"💾 Model saved to: ./plant_vision_outputs")
+
+#%%
+# Simple inference test
+print("\n🧪 Running inference test...")
+
+# Test with a few validation samples
+test_samples = val_conversation_dataset[:3]  # Test with first 3 samples
+
+for i, sample in enumerate(test_samples):
+    print(f"\n--- Test Sample {i+1} ---")
+    
+    # Get the message format for inference
+    messages = sample["messages"]
+    user_content = messages[0]["content"]
+    expected_response = messages[1]["content"][0]["text"]
+    
+    print(f"Expected: {expected_response}")
+    
+    # Prepare input for inference
+    inputs = tokenizer.apply_chat_template(
+        messages[:-1],  # Exclude assistant response for inference
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to("cuda")
+    
+    # Generate response
+    with torch.no_grad():
+        outputs = peft_model.generate(
+            **inputs,
+            max_new_tokens=128,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    
+    # Decode response (only new tokens)
+    response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+    generated_response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+    
+    print(f"Generated: {generated_response}")
+    print("-" * 50)
+
+print("\n✅ Inference test completed!")
